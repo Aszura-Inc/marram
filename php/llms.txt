@@ -1,0 +1,292 @@
+# marram/php
+
+> Marram API client for PHP 8.1+. Connects end users' third-party accounts, calls those
+> providers' APIs through Marram, manages provider webhooks, and signs users in with OAuth2.
+> Works with any PSR-18 HTTP client (auto-discovered). Holds the secret API key: server-side only.
+
+This file is for AI coding assistants. Follow the rules first; the reference follows.
+
+## Rules
+
+1. **Never expose the API key.** Never echo it, put it in JavaScript, or send it to the browser.
+   Browser code uses `@aszura/marram-browser`, which talks directly to Marram with a token
+   you mint server-side.
+2. **Connections belong to your user ID.** `connections->init` requires `externalUserId` — your
+   own opaque ID for the user — and every later proxy, refresh, revoke and webhook call addresses
+   the connection with that same ID. There is no Marram key to persist. Reconnecting the same
+   user replaces their connection.
+3. **PKCE on every connect and sign-in.** `init` takes a `codeChallenge`; `claim` needs the
+   matching `codeVerifier`, the `claimCode` query parameter the redirect arrived with — and for
+   connections the `flowId` init returned. Nothing is live until claimed. Keep the flowId and
+   verifier together in the starting user's `$_SESSION`, or in the browser's `sessionStorage` via
+   `@aszura/marram-browser`. A connect redirect carries `?status=connected&claimCode=…` — never
+   a key. The `claimCode` is one-time and exists only in that redirect, so a flow can only be
+   claimed from it.
+4. **Claim once.** Single-use, expires 30 minutes after the provider step. `unset()` the stored
+   verifier when you read it.
+5. **Set `auth`, `redirectUrl` and the provider on the server.** If the request picks a provider,
+   check it against an allowlist with `in_array(..., true)`.
+6. **Branch on `$e->errorCode`, never `$e->getMessage()`.** Unknown codes: fall back to `$e->status`.
+7. **Proxy responses are the provider's.** `$marram->proxy->request()` returns a PSR-7
+   `ResponseInterface` for every provider status. Check `getStatusCode()` yourself. Only Marram's own
+   refusals throw. It is **not signed**: don't run `Signature::verifyMessage` on it.
+8. **Verify webhooks with the raw body** (`file_get_contents('php://input')`), never a
+   re-encoded `json_decode` result.
+9. All responses are associative arrays (shapes below), not objects. Exceptions:
+   `ConnectionRedirect`, `ConnectToken` (objects) and proxy responses (PSR-7).
+10. **Finish endpoint for `@aszura/marram-browser`? Use `Marram\ConnectFlow` /
+    `Marram\SignInFlow`.** Their `serveFinish` / `replyFinish` serve a sign-in, or a connect
+    started with `claim: 'server'`. Don't keep the provider in `$_SESSION`: the browser sends it
+    with the finish payload. The package no longer calls their start side, which remains for
+    browser code you write yourself.
+11. **The browser package starts every flow with a token.** `$marram->connectToken($userId)` /
+    `$marram->signInToken()` (needs `signingSecret:` on the Client) mint a short-lived token
+    locally — no API call — and the browser runs the flow directly against Marram with
+    `connect(provider, { token })` / `signIn(provider, { token })`. One token starts exactly one
+    flow, does one browser `disconnect`, or starts one browser `setUpWebhook` (manual webhook
+    setup); it can still claim its flow after it expires. Pass
+    `redirectUrl:` when minting (no dashboard setup needed); without it the page's URL
+    must be on the environment's redirect allowlist, and a set allowlist binds the token's URL too.
+    Don't sign a URL taken from the browser unchecked. Sign-in claims always stay on your server
+    with the API key.
+
+## Install and create a client
+
+```php
+// composer require marram/php   (plus a PSR-18 client, e.g. guzzlehttp/guzzle)
+$marram = new Marram\Client(
+    apiKey: getenv('MARRAM_API_KEY'),
+    // environment: 'staging',          // default 'production'
+    // baseUrl: 'https://…/v1',          // overrides environment; include /v1
+    // httpClient: $psr18Client,         // requestFactory:, streamFactory: also accepted
+    // signingSecret: getenv('MARRAM_SIGNING_SECRET'), // for connectToken()/signInToken()
+);
+```
+
+## Connect a user's account
+
+```php
+// Start (behind your login):
+$pkce = Marram\Pkce::create();
+$result = $marram->connections->init('google', [
+    'auth' => 'oAuth2',
+    'redirectUrl' => 'https://yourapp.com/connected',
+    'codeChallenge' => $pkce['codeChallenge'],
+    'codeChallengeMethod' => $pkce['codeChallengeMethod'], // 'S256'
+    'externalUserId' => (string) $user->id,                // required: your opaque user id
+]);
+$_SESSION['marram_connect'] = ['flowId' => $result['flowId'], 'codeVerifier' => $pkce['codeVerifier']];
+header('Location: ' . $result['authorizationUrl']);
+exit;
+
+// Return at /connected (lands with ?status=connected&claimCode=…), same browser session:
+$redirect = Marram\ConnectionRedirect::parse($_SERVER['REQUEST_URI']);
+$pendingFlow = $_SESSION['marram_connect'] ?? null;
+unset($_SESSION['marram_connect']);
+if ($redirect->ok && $pendingFlow !== null) {
+    $connection = $marram->connections->claim('google', $pendingFlow['flowId'], $pendingFlow['codeVerifier'], $redirect->claimCode);
+    markConnected($user->id, $connection['providerKey']); // address it by $user->id from now on
+} elseif (!$redirect->ok) {
+    // $redirect->error, $redirect->errorMessage: declined or provider failure
+}
+```
+
+## Serve `@aszura/marram-browser` (browser-side PKCE)
+
+The browser package starts flows with a token you mint, and a sign-in, or a connect started with
+`claim: 'server'`, finishes at an endpoint you mount with `ConnectFlow` (or `SignInFlow`). It runs
+behind your own login. `serveStart` / `replyStart` remain for browser code you write yourself.
+
+```php
+$connect = new Marram\ConnectFlow(
+    $marram,
+    ['google', 'trello'],                 // allowlist; or ['trello' => ['integrationKey' => '…', 'auth' => 'oAuth1']]
+    'https://yourapp.com/connected',      // or fn (string $provider): string
+    // auth: 'oAuth2', theme: 'light'|'dark'
+);
+
+// Plain PHP: reads php://input, sets the status, echoes JSON.
+// POST /marram/start
+$connect->serveStart(externalUserId: (string) $user->id);
+// POST /marram/finish
+$connect->serveFinish(function (array $claimed) use ($user): array {
+    markConnected($user->id, $claimed['connection']['providerKey']);
+    return ['connected' => true];         // answered as JSON; null answers ['ok' => true]
+});
+
+// Laravel / Symfony / any framework: the same as ['status' => int, 'body' => array].
+$reply = $connect->replyStart($request->json()->all(), externalUserId: (string) $user->id);
+return response()->json($reply['body'], $reply['status']);
+$reply = $connect->replyFinish($request->json()->all(), fn (array $claimed) => save($claimed));
+
+// Lowest level, throwing instead of replying:
+$started = $connect->start($input, externalUserId: '…'); // ['provider', 'flowId', 'authorizationUrl']
+$claimed = $connect->finish($input);                      // ['provider', 'flowId', 'connection' => [...]]
+```
+
+`ConnectFlow::start` requires `externalUserId` (the connection's identity) and refuses to start
+without one. `SignInFlow($marram, $providers, $redirectUrl, ?theme)` is the same for sign-in:
+start answers `['provider', 'sessionKey', 'authorizationUrl']`, finish gives
+`['provider', 'sessionKey', 'user', 'raw']`.
+
+Input: start takes `{provider, codeChallenge, codeChallengeMethod: 'S256'}`, finish takes
+`{provider, flowId|sessionKey, codeVerifier, claimCode}`, exactly what the browser package sends. Bad
+input throws `Marram\FlowInputException` (`$status` 400, `$errorCode` `UNKNOWN_PROVIDER` or
+`INVALID_INPUT`). `reply*` / `serve*` answer `['code', 'error', 'requestId'?]`: 400 for bad input
+or a claim Marram refused (`CONNECTION_NOT_FOUND`, `SESSION_NOT_FOUND`, `CODE_VERIFIER_MISMATCH`,
+`MISSING_PKCE_PARAMETERS`, `CLAIM_CODE_MISMATCH`, `MISSING_CLAIM_CODE`), 502 for any other `MarramException`; anything else is rethrown.
+`Marram\Flow::errorReply(\Throwable $e)` gives that reply (or null) for your own handlers, and
+`$connect->providers()` lists the allowlist.
+
+## Sign users in
+
+```php
+$pkce = Marram\Pkce::create();
+$result = $marram->sessions->init('google', [
+    'auth' => 'oAuth2',
+    'redirectUrl' => 'https://yourapp.com/signed-in',
+    'codeChallenge' => $pkce['codeChallenge'],
+    'codeChallengeMethod' => 'S256',
+]);
+$_SESSION['marram'] = ['sessionKey' => $result['sessionKey'], 'codeVerifier' => $pkce['codeVerifier']];
+// redirect to $result['authorizationUrl'], then at /signed-in?sessionKey=…&claimCode=…:
+$pending = $_SESSION['marram'];
+unset($_SESSION['marram']);
+$info = $marram->sessions->claim('google', $pending['sessionKey'], $pending['codeVerifier'], (string) ($_GET['claimCode'] ?? ''));
+$info['user']; // normalized user; $info['raw'] is the provider's payload
+```
+
+## Call a provider's API
+
+```php
+$response = $marram->proxy->request('GET', 'trello', '1/members/me/boards', $userId);
+if ($response->getStatusCode() >= 400) { /* provider error */ }
+$boards = json_decode((string) $response->getBody(), true);
+
+$marram->proxy->request(
+    'POST', 'github', 'repos/acme/app/issues', $userId,
+    body: ['title' => 'Bug'],                         // sent as JSON
+    query: ['per_page' => '50'],
+    headers: ['Accept' => 'application/vnd.github+json'],
+    // contentType: 'application/x-www-form-urlencoded', version: '2022-11-28', integrationKey: '…',
+);
+```
+
+`$path` must be non-empty and contain no `..` segment. Caller headers starting with `x-marram-`
+are dropped.
+
+Async: `$marram->proxy->enqueue($method, $provider, $path, $userId, $callbackUrl, ...)`
+returns `['requestId' => …]` (HTTP 202). The provider's response is POSTed to `$callbackUrl`
+(public HTTPS). Verify it with `Signature::verifyWebhook`.
+
+## Webhooks
+
+```php
+$raw = file_get_contents('php://input');
+if (!Marram\Signature::verifyWebhook(getallheaders(), $raw, getenv('MARRAM_SIGNING_SECRET'))) {
+    http_response_code(401);
+    exit;
+}
+$event = json_decode($raw, true);
+```
+
+`$secrets` may be an array during rotation. Default tolerance is 300 s. It never throws.
+`Signature::verifyMessage($psr7Message, $secrets)` works on PSR-7 requests/responses and rewinds the
+body. `Signature::verify($body, $timestamp, $signature, $secrets)` is the low-level form.
+
+```php
+$marram->webhooks->register('github', $userId, body: [/* kind-specific */], kind: 'push', metadata: 'repo-42');
+$marram->webhooks->list('github', $userId);
+$marram->webhooks->get('github', $webhookKey, $userId);
+$marram->webhooks->update('github', $webhookKey, $userId, body: [...]);
+$marram->webhooks->delete('github', $webhookKey, $userId);
+$manual = $marram->webhooks->initManual('stripe', $userId, redirectUrl: 'https://yourapp.com/done');
+// paste $manual['ingressUrl'] at the provider, send the user to $manual['setupUrl']
+```
+
+`delete` answers `unregisteredAtProvider`: `false` for a manual webhook or one whose connection was
+revoked, which Marram clears without calling the provider. The provider may still hold it; remove
+it in the provider's dashboard. Revoking or disconnecting a user leaves their webhooks running until
+you delete them. The browser SDK's `setUpWebhook` starts a manual setup with a connect token (Marram
+picks the `webhookKey`); `initManual` is the API-key form, needed for a custom key or metadata.
+
+## API reference
+
+All methods throw `Marram\MarramException` on a Marram error. `?string $integrationKey` is
+only needed when a provider has several integrations and no default.
+
+| Call | Returns |
+| --- | --- |
+| `connections->init(string $provider, array{auth, redirectUrl, codeChallenge, codeChallengeMethod: 'S256', externalUserId, theme?: 'light'|'dark'} $body, ?string $integrationKey = null)` | `array{flowId, authorizationUrl, message?}` |
+| `connections->claim(string $provider, string $flowId, string $codeVerifier, string $claimCode)` | Connection array |
+| `connections->refresh(string $provider, string $externalUserId, ?string $integrationKey = null)` | Connection array (409 `CONFLICT` if a refresh is running) |
+| `connections->revoke(string $provider, string $externalUserId, ?string $integrationKey = null)` | `void`. The browser SDK's `disconnect` does this with a connect token, for the token's own user. The user's webhooks keep running until deleted |
+| `connections->get(string $provider, string $externalUserId, ?string $integrationKey = null)` | Connection array (no refresh, no provider call; 404 `CONNECTION_NOT_FOUND`, 410 `CONNECTION_REVOKED`) |
+| `connections->list(string $provider, string $integrationKey)` | `list<Connection>` |
+| `sessions->init(string $provider, array{auth: 'oAuth2', redirectUrl, codeChallenge, codeChallengeMethod, externalUserId?, theme?} $body, ?string $integrationKey = null)` | `array{sessionKey, authorizationUrl, message?}` |
+| `sessions->claim(string $provider, string $sessionKey, string $codeVerifier, string $claimCode)` | `array{user, raw}` |
+| `sessions->userinfo(string $provider, string $sessionKey, ?string $integrationKey = null)` | `array{user, raw}` |
+| `sessions->refresh(string $provider, string $sessionKey)` | Session array |
+| `sessions->revoke(string $provider, string $sessionKey, ?string $integrationKey = null)` | `void` |
+| `sessions->get(string $provider, string $sessionKey)` | Session array (no refresh, no provider call; 404 `SESSION_NOT_FOUND`, 410 `SESSION_REVOKED`) |
+| `sessions->list(string $provider, ?string $integrationKey = null)` | `list<Session>` |
+| `proxy->request(string $method, string $provider, string $path, string $externalUserId, mixed $body = null, array $query = [], array $headers = [], ?string $integrationKey = null, ?string $version = null, ?string $contentType = null)` | `Psr\Http\Message\ResponseInterface` |
+| `proxy->enqueue(string $method, string $provider, string $path, string $externalUserId, string $callbackUrl, …same optional args)` | `array{requestId}` |
+| `webhooks->register(string $provider, string $externalUserId, array $body = [], ?string $kind = null, ?string $webhookKey = null, ?string $metadata = null, ?string $version = null, ?string $integrationKey = null)` | `array{success, webhookKey, providerWebhookId?, kind?}` |
+| `webhooks->list(string $provider, string $externalUserId, ?string $integrationKey = null)` | `list<Webhook>` |
+| `webhooks->get(string $provider, string $webhookKey, string $externalUserId, ?string $integrationKey = null)` | Webhook array |
+| `webhooks->update(string $provider, string $webhookKey, string $externalUserId, array $body = [], ?string $version = null, ?string $integrationKey = null)` | `array{success, webhookKey, …}` |
+| `webhooks->delete(string $provider, string $webhookKey, string $externalUserId, ?string $version = null, ?string $integrationKey = null)` | `array{success, webhookKey, unregisteredAtProvider, …}` |
+| `webhooks->initManual(string $provider, string $externalUserId, ?string $redirectUrl = null, ?string $integrationKey = null)` | `array{sessionId, webhookKey, setupUrl, ingressUrl, status: 'pending', fields}`. The browser SDK's `setUpWebhook` does this with a connect token |
+| `environment->integrations()` | `list<array>` |
+| `environment->identityProviders()` | `list<array>` — enabled for sign-in, filtered by release status. The browser SDK's `listIdentityProviders` fetches a trimmed list with a sign-in token |
+| `environment->providers(?string $externalUserId = null)` | `list<array>` — what a user can connect; with `$externalUserId`, each integration's `connected`/`connectionStatus` is that user's, else null. The browser SDK's `listProviders` fetches the same list with a connect token |
+
+Browser-flow classes: `Marram\ConnectFlow(Client $marram, array $providers, string|\Closure $redirectUrl, string $auth = 'oAuth2', ?string $theme = null)`
+and `Marram\SignInFlow(Client $marram, array $providers, string|\Closure $redirectUrl, ?string $theme = null)`,
+both with `start(mixed $input, ?string $externalUserId = null)`, `finish(mixed $input)`,
+`replyStart(mixed $input, ?string $externalUserId = null)`, `replyFinish(mixed $input, callable $onClaimed)`
+→ `['status' => int, 'body' => array]`, `serveStart(?string $externalUserId = null)`,
+`serveFinish(callable $onClaimed)`, `providers()`; `Marram\FlowInputException` (`$status`, `$errorCode`);
+`Marram\Flow::errorReply(\Throwable $e)`.
+
+Static helpers: `Marram\Pkce::create()` → `['codeVerifier', 'codeChallenge', 'codeChallengeMethod' => 'S256']`;
+`Marram\ConnectionRedirect::parse(string $url)` → object with `ok`, `claimCode`, `error`, `errorMessage`
+(`error` is `'missing_status'` when the URL carries neither `status=connected` nor `error`,
+`'missing_claim_code'` when a connected redirect has no `claimCode`);
+`Marram\Signature::verifyWebhook / verifyMessage / verify`.
+
+Tokens (`$expiresIn` over 600 throws): `$marram->connectToken(string $externalUserId, ?string $provider = null, ?string $integrationKey = null, int $expiresIn = 600, ?string $redirectUrl = null)`
+and `$marram->signInToken(?string $externalUserId = null, …)` → `Marram\ConnectToken` object
+with `token`, `jti` (echoed by the claim, so you can match results to the token you issued) and
+`expiresAt`. Both need `signingSecret:` on the Client. `Marram\ConnectToken::mint(...)` is the
+standalone signer.
+
+Connection array keys: `externalUserId, providerKey, integrationKey, providerUserId?, authType,
+status, grantedScopes?, expiresAt?, lastRefreshedAt?, lastUsedAt?, lastError?, lastErrorAt?,
+createdAt, updatedAt, disconnectedAt?`. Session arrays have the same keys plus `sessionKey`.
+`authType` is one of `oAuth1, oAuth2, api_key, basic, session`. `status` is one of `active,
+pending, reauth_required, error, revoked, inactive`.
+
+## Errors
+
+```php
+try {
+    $marram->connections->refresh('google', $userId);
+} catch (Marram\MarramException $e) {
+    $e->status;     // HTTP status
+    $e->errorCode;  // stable code; "HTTP_<status>" if none was sent
+    $e->requestId;  // quote in support requests
+    $e->body;       // decoded JSON or raw text
+    if ($e->errorCode === 'CONFLICT') { /* refresh already running; retry shortly */ }
+}
+```
+
+Common codes: `INVALID_API_KEY`, `API_KEY_EXPIRED`, `IP_NOT_ALLOWED`, `RATE_LIMITED`,
+`LIMIT_EXCEEDED`, `CONFLICT`, `PROVIDER_NOT_FOUND`, `INTEGRATION_NOT_FOUND`,
+`INTEGRATION_KEY_REQUIRED` (pass `$integrationKey`), `CONNECTION_NOT_FOUND`, `SESSION_NOT_FOUND`,
+`WEBHOOK_NOT_FOUND`, `MISSING_EXTERNAL_USER_ID`, `MISSING_FLOW_ID`, `MISSING_PKCE_PARAMETERS`,
+`CODE_VERIFIER_MISMATCH` (wrong or reused verifier; start again), `AUTH_TYPE_NOT_SUPPORTED`,
+`BLOCKED_PATH`; token flows add `INVALID_CONNECT_TOKEN`, `CONNECT_TOKEN_EXPIRED`,
+`CONNECT_TOKEN_REUSED`, `CONNECT_TOKEN_WRONG_USE`, `REDIRECT_URL_NOT_ALLOWED`. The full list is in
+`openapi.yaml` under `components.schemas.Error`.

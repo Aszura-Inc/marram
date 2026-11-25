@@ -1,0 +1,346 @@
+# @aszura/marram-browser
+
+> The browser half of Marram's connect and sign-in flows. Your backend mints a short-lived token;
+> the package makes a PKCE pair on click, runs `init` directly against Marram with that token,
+> keeps the verifier (with the provider, flow id and your state) in that tab's `sessionStorage`,
+> navigates to the provider, and on return finishes the flow. It never sees the API key. Includes
+> optional React bindings at `@aszura/marram-browser/react`. No dependencies.
+
+This file is for AI coding assistants. Follow the rules first; the reference follows.
+
+## Rules
+
+1. **Every flow starts with a token.** `connect(provider, { token })` and
+   `signIn(provider, { token })` are the only ways to start. Your backend mints the token with
+   `marram.connectToken({ externalUserId })` / `signInToken()`; minting is local signing, not an
+   API call. Never put a Marram **API key** or signing secret in browser code.
+2. **Pass `token` as a function that fetches one.** It runs on click, so the ten minutes start with
+   the flow. It may resolve a string or `{ token, baseUrl? }`. A token starts exactly one flow; a
+   second `connect` with it answers `CONNECT_TOKEN_REUSED`. A refused `connect` doesn't spend it,
+   so a corrected retry can reuse it. It only has to be valid at the start:
+   `finish` can claim with it after it expires, so never mint a long-lived token for a slow sign-in.
+3. **Who claims.** A `connect` is claimed by `finish()` directly against Marram by default, and
+   `result.data` is `{ status: 'connected', jti }`, never connection fields. With
+   `claim: 'server'`, or for any **sign-in**, `finish({ url })` posts to your endpoint, which claims
+   with the API key. Use `claim: 'server'` when your server must see the claim. It doesn't give a
+   slow provider sign-in more time: the user has ten minutes with the provider either way, and the
+   thirty-minute wait for `claim` starts after that step.
+4. **Finish endpoint contract:** receives JSON `{ provider, flowId, codeVerifier, claimCode, ...body }`
+   (or `sessionKey`), calls `claim(provider, key, codeVerifier, claimCode)`, stores the result
+   against the logged-in user, and answers any JSON. That answer becomes `result.data`. The
+   `claimCode` is the one-time code on the redirect URL: `finish()` reads it there and sends it
+   on, and Marram refuses a claim without it.
+5. **Redirects.** A `redirectUrl` in the token wins and the option here is ignored. Without one, the
+   `redirectUrl` option (default: the current page without query/hash) must be on the environment's
+   redirect allowlist, and a set allowlist binds the token's URL too; anything else answers
+   `REDIRECT_URL_NOT_ALLOWED`. Never sign a URL from the request unchecked.
+6. **Carry app context with `state`, not the URL or your session.** `state` is kept in the tab and
+   comes back as `result.state` from `finish`. JSON only; it is never sent anywhere.
+7. **Same tab start to finish.** `sessionStorage` is per tab. The provider must redirect back to
+   the tab that started the flow (normal redirects do). Don't open the authorization URL in a new
+   tab or popup.
+8. **`finish` claims once.** Marram allows one claim per flow, so a reload can't replay it. It
+   keeps the pending flow and the URL until the claim settles, so when `error.retryable` is true,
+   call `finish` again or reload. It's safe to call on every load of the redirect page; it returns
+   `null` on an ordinary visit.
+9. **With a client-side router, pass `cleanUrl`.** The default `history.replaceState` is invisible
+   to React Router and Next.js. `cleanUrl: (path) => navigate(path, { replace: true })` (React
+   Router) or `cleanUrl: (path) => router.replace(path)` (Next.js) keeps the router in sync.
+10. **Next.js App Router: client components only.** `useMarramFinish`, `useMarramStart` and
+    `MarramButton` need `'use client'` at the top of the file that uses them.
+11. **If the app already has an HTTP client** (axios instance, bearer tokens, refresh, `{ data }`
+    envelopes), use it inside the `token` function, and pass `send` to `finish` instead of `url`.
+    `send(payload)` delivers the payload however the backend wants it and resolves what becomes
+    `result.data`. `send` excludes `url`, `headers`, `credentials` and `fetch`. The script tag's
+    `data-finish` only supports `url`.
+12. **Running `init` and `claim` yourself?** Don't use this package. Make the PKCE pair on the
+    server, keep the verifier in the user's session, and follow the server SDK's flow.
+13. **Draw the buttons from `listProviders({ token })`.** It takes the same connect token (listing
+    doesn't spend it) and returns the providers this user can connect, each with `integrations`,
+    and per integration `authTypes`, `connected` and `connectionStatus`. Pass the entry's
+    `integrationKey` and one of its `authTypes` to `connect`; the list doesn't say which integration
+    is the default. Show "Reconnect" for `connectionStatus: 'reauth_required'`. Never write a
+    backend route for this, and never cache the list: it is per user.
+14. **After a flow, `finish()` is the truth.** Mark the provider connected from its result, then
+    `reload()` the list if you show it; a list fetched right away can lag by up to ~30 s.
+15. **Offer "Disconnect" with `disconnect(provider, { token, integrationKey? })`.** It takes a connect
+    token, disconnects the token's own user, and needs no backend route. The token needn't name a
+    provider. Each token disconnects once and can't start a flow afterwards, so pass a function that
+    mints a fresh one. Update the page from its result, not a reloaded list. Disconnecting leaves
+    the user's webhooks running until your server deletes them.
+16. **Draw a login page from `listIdentityProviders({ token })`.** Use a sign-in token: listing
+    doesn't spend it, and `signIn` refuses a connect token. It returns the providers enabled for
+    sign-in, each with `integrations` of `integrationKey` and `label`. Pass the entry's
+    `integrationKey` to `signIn`. Never write a backend route for this.
+17. **Start a manual webhook setup with `setUpWebhook(provider, { token, integrationKey?, redirectUrl? })`.**
+    It takes a connect token for an already-connected user, sends them to Marram's hosted setup
+    form (`setupUrl`) and they land back on `redirectUrl`; there's no `finish`. It spends the token.
+    Marram picks the `webhookKey`: a custom key or metadata needs the server SDK's `initManual`.
+
+## Install
+
+```sh
+npm install @aszura/marram-browser
+```
+
+No-build alternative: `<script src="https://cdn.jsdelivr.net/npm/@aszura/marram-browser/dist/marram.min.js"></script>`
+sets `window.Marram`, and runs `finish` if the tag has `data-finish="/your/finish/endpoint"`.
+
+## Vanilla usage
+
+```ts
+import { connect, signIn, finish, listProviders, MarramError } from '@aszura/marram-browser';
+
+const getToken = () => fetch('/marram/token', { method: 'POST' }).then((r) => r.json());
+
+// Page load: the providers this user can connect, with their connection state.
+const providers = await listProviders({ token: getToken }); // throws LIST_FAILED
+const [provider] = providers;
+const [integration] = provider.integrations; // { integrationKey, label, authTypes, connected, connectionStatus }
+
+// Connect button:
+button.addEventListener('click', () => {
+  connect(provider.providerKey, {
+    token: getToken, // fresh token on click
+    integrationKey: integration.integrationKey,
+    auth: integration.authTypes[0],
+    state: { returnTo: '/settings?tab=mail' },
+  }).catch(showError);
+});
+
+// Page at your redirectUrl:
+try {
+  const result = await finish<{ status: string }, { returnTo: string }>();
+  if (result === null) {
+    // not a Marram redirect
+  } else if (result.ok) {
+    // result.kind: 'connection' | 'session', result.provider, result.key,
+    // result.data ({ status: 'connected', jti }), result.state
+    location.replace(result.state.returnTo);
+  } else {
+    // user declined / provider error: result.error, result.errorMessage,
+    // result.state (from the flow this tab started last, or undefined)
+  }
+} catch (error) {
+  if (error instanceof MarramError && error.code === 'VERIFIER_NOT_FOUND') {
+    // started in another tab/browser, or already used. Start again.
+  }
+}
+```
+
+Your server claims a connect:
+
+```ts
+connect('google', { token: getToken, claim: 'server' });
+// …then on return:
+const result = await finish({ url: '/marram/finish' }); // result.data is your endpoint's JSON
+```
+
+Sign-in: the token starts it, your backend always claims it.
+
+```ts
+signIn('google', { token: getSignInToken }); // minted with redirectUrl: 'https://yourapp.com/signed-in'
+// …then on return:
+await finish({ url: '/marram/finish' });
+```
+
+Through an existing HTTP client:
+
+```ts
+// Backend answers { data: { token, baseUrl } }
+connect('google', { token: () => api.post('/marram/token').then((r) => r.data.data), claim: 'server' });
+
+// Claim through the same client; p already has provider, key, codeVerifier and claimCode
+finish({ send: (p) => api.post('auth', p).then((r) => r.data) });
+```
+
+The script build's `data-finish` fires `marram:finished` (detail: `FinishResult`) or
+`marram:error` on `document`.
+
+## React
+
+```tsx
+'use client'; // Next.js App Router
+import { MarramButton, useMarramStart, useMarramFinish } from '@aszura/marram-browser/react';
+
+<MarramButton token={getToken} provider="google" state={{ returnTo: '/settings' }} onError={(e) => toast(String(e))}>
+  Connect Google
+</MarramButton>;
+
+function Connected() {
+  const navigate = useNavigate(); // React Router; Next.js: const router = useRouter() from 'next/navigation'
+  const { loading, result, error } = useMarramFinish<{ status: string }, { returnTo: string }>({
+    cleanUrl: (path) => navigate(path, { replace: true }), // Next.js: router.replace(path)
+  });
+  if (loading) return <p>Finishing…</p>;
+  if (error) return <p>Something went wrong. Try connecting again.</p>;
+  if (result?.ok === false) return <p>{result.errorMessage ?? 'Cancelled.'}</p>;
+  if (result?.ok) return <Navigate to={result.state.returnTo} />;
+  return null;
+}
+```
+
+- `MarramButton`: `<button>` that starts a flow on click with its `token`, `provider`,
+  `integrationKey`, `state` and `body` props. It is disabled and `aria-busy` while pending. Other
+  props pass through to the button, and `type` defaults to `button`. An `onClick` that calls
+  `preventDefault()` cancels the start.
+- `useMarramStart(options)` returns `{ start(provider, extras?), pending, error }`, where `extras`
+  is `{ state?, body?, redirectUrl?, auth?, integrationKey?, theme? }`. One hook serves a whole menu
+  of providers. `start` never throws: failures go to `error` and `onError`, and it resolves
+  `undefined`.
+- `useMarramIdentityProviders({ token, environment?, baseUrl?, fetch?, enabled? })` is the same
+  hook for `listIdentityProviders`, with the same return shape. Start with `flow: 'signIn'`.
+- `useMarramProviders({ token, environment?, baseUrl?, fetch?, enabled? })` runs `listProviders`
+  once on mount (StrictMode-safe) and returns `{ loading, providers, error, reload }`. `providers`
+  is `[]` until loaded and kept across a failed reload; `error` is a `LIST_FAILED`. Call `reload()`
+  after a flow finishes. Draw buttons from it:
+  `start(p.providerKey, { integrationKey: i.integrationKey, auth: i.authTypes[0] })`.
+- Both take `token`, `flow` (`'connect'` default, or `'signIn'`), `claim`, and `connect`'s options.
+  A `token` function receives `(provider, extras)`, so a backend can sign the redirect.
+- `useMarramFinish(options)` runs `finish` once on mount (StrictMode-safe) and returns
+  `{ loading, result, error }`. Pass `enabled: false` to defer, e.g. until your auth has loaded.
+  Takes `url` or `send`, plus `body` and `cleanUrl`. An inline `send` that changes every render is
+  fine.
+- React ≥ 16.8 is an optional peer dependency. Only the `/react` entry point imports it.
+
+## API reference
+
+```ts
+type MintedToken = string | { token: string; baseUrl?: string };
+
+type TokenFlowOptions = {
+  token: string | (() => MintedToken | Promise<MintedToken>);
+  environment?: 'production' | 'staging';   // default 'production'
+  baseUrl?: string;                     // overrides environment; include /v1
+  redirectUrl?: string;                 // ignored when the token carries one
+  auth?: string;                        // default 'oAuth2'; one of the integration's authTypes
+  integrationKey?: string;              // sent as x-marram-integration-key; from listProviders
+  theme?: 'light' | 'dark';
+  body?: Record<string, unknown>;       // extra init fields; the challenge and redirect win on conflict
+  state?: unknown;                      // JSON; comes back as finish's result.state
+  navigate?: ((url: string) => void) | false; // default location.assign; false = don't navigate
+  fetch?: typeof fetch;
+};
+
+connect(provider, TokenFlowOptions & { claim?: 'marram' | 'server' }): Promise<StartResult>
+signIn(provider, TokenFlowOptions): Promise<StartResult>
+// StartResult: { kind: 'connection' | 'session'; provider: string; key: string; authorizationUrl: string }
+// key is the flowId (connections) or sessionKey (sign-in)
+
+listProviders({ token, environment?, baseUrl?, fetch? }): Promise<ConnectableProvider[]>
+// ConnectableProvider: { providerKey; name; brandColors; brandImages; integrations: ConnectableIntegration[] }
+// ConnectableIntegration: { integrationKey; label; authTypes: string[]; connected: boolean;
+//   connectionStatus: 'active' | 'pending' | 'reauth_required' | 'error' | 'revoked' | 'inactive' | null }
+// GET /environment/providers with the connect token; a token locked to a provider or integration
+// lists only that. Never cached (per user).
+
+disconnect(provider, { token, integrationKey?, environment?, baseUrl?, fetch? }): Promise<void>
+// DELETE /connections/{provider}/revoke with a connect token; spends the token. Throws DISCONNECT_FAILED.
+
+setUpWebhook(provider, { token, integrationKey?, redirectUrl?, navigate?, environment?, baseUrl?, fetch? }): Promise<WebhookSetup>
+// WebhookSetup: { webhookKey; setupUrl; ingressUrl }
+// POST /webhooks/{provider}/init with a connect token and body { redirectUrl }; spends the token.
+// Navigates to setupUrl unless navigate: false. The user must already be connected
+// (CONNECTION_NOT_FOUND / CONNECTION_REVOKED). Throws START_FAILED.
+
+listIdentityProviders({ token, environment?, baseUrl?, fetch? }): Promise<IdentityProvider[]>
+// IdentityProvider: { providerKey; name; brandColors; brandImages; integrations: IdentityIntegration[] }
+// IdentityIntegration: { integrationKey; label }
+// GET /environment/identity-providers with a sign-in token; a locked token lists only that.
+
+// Endpoint options for finish: exactly one of these two shapes.
+type FetchEndpointOptions = {
+  url: string;                          // your endpoint, POSTed as JSON
+  headers?: HeadersInit;                // e.g. CSRF token
+  credentials?: RequestCredentials;     // default 'same-origin'
+  fetch?: typeof fetch;
+};
+type SendEndpointOptions = {
+  send: (payload: Record<string, unknown>) => Promise<unknown>; // resolve what becomes result.data
+};
+
+finish<T, S>(options?: Partial<FetchEndpointOptions | SendEndpointOptions> & {
+  body?: Record<string, unknown>;       // extra payload fields; provider, key, codeVerifier and claimCode win on conflict
+  location?: string | URL;              // default location.href
+  cleanUrl?: boolean | ((path: string) => void); // default true unless `location` given; a function gets
+                                        // the clean path+search+hash to replace through your router
+}): Promise<
+  | { ok: true; kind: 'connection' | 'session'; provider: string; key: string; data: T; state: S }
+  | { ok: false; error: string; errorMessage: string | null; state: S | undefined }
+  | null                                // not a Marram redirect
+>
+// url/send may be omitted only when every flow is a connect that Marram claims.
+
+createPkce(): Promise<{ codeVerifier; codeChallenge; codeChallengeMethod: 'S256' }>
+parseRedirect(url): { ok: true; kind: 'connection'; key: null; claimCode: string | null }
+  | { ok: true; kind: 'session'; key; claimCode: string | null }
+  | { ok: false; error; errorMessage } | null   // connect redirects carry ?status=connected, no key
+redirectPath(url): string               // path + search + hash without Marram's params
+```
+
+`connect` and `signIn` only navigate to `http(s)` URLs, and reject anything else with
+`INVALID_START_RESPONSE`. Pending flows older than one hour are cleaned up the next time a flow
+starts; a declined redirect drops the flow this tab started last. A connect redirect carries no key,
+so `finish` resolves it to the flow this tab started last.
+
+## Errors
+
+`connect`, `signIn`, `disconnect`, `setUpWebhook`, `listProviders`, `listIdentityProviders` and `finish` throw `MarramError` with `code`, `status` (HTTP
+status or null) and `body` (the response, parsed if JSON). Branch on `code`:
+
+| code | Meaning |
+| --- | --- |
+| `START_FAILED` | Marram's init (`connect`, `signIn` or `setUpWebhook`) answered non-2xx or was unreachable, or the `token` function failed. `apiCode` is Marram's code. |
+| `DISCONNECT_FAILED` | The same for `disconnect`. `status: 409` means the token was already used. |
+| `LIST_FAILED` | The same for `listProviders` or `listIdentityProviders`, or the answer had no list. A failed page load, not a failed click. |
+| `INVALID_START_RESPONSE` | Marram's answer lacked an http(s) `authorizationUrl` or a `flowId`/`sessionKey` (for `setUpWebhook`: an http(s) `setupUrl`, `webhookKey` or `ingressUrl`). |
+| `FINISH_FAILED` | Your finish endpoint or Marram's claim answered non-2xx or was unreachable, or `send` rejected. If `retryable` is true (no answer, a 429 or a 5XX), call `finish` again; otherwise start the flow again. |
+| `STORAGE_UNAVAILABLE` | `sessionStorage` blocked (some private modes, sandboxed iframes). |
+| `VERIFIER_NOT_FOUND` | This tab didn't start this flow, or it was already used. |
+
+When a `token` function or `send` rejects, the original error is `cause`. `status`/`body` are taken
+from `err.status`/`err.body`, else axios-style `err.response.status`/`err.response.data`, else
+`null`. A `MarramError` they throw is rethrown unchanged.
+
+Marram's own code is on `error.apiCode`, and `error.message` includes its explanation:
+`CONNECT_TOKEN_EXPIRED` (401), `CONNECT_TOKEN_REUSED`
+(409), `INVALID_CONNECT_TOKEN` (401/403), `REDIRECT_URL_NOT_ALLOWED` (403), `RATE_LIMITED` (429).
+Token calls share one per-IP limit, and a page load now spends one on the list, so a flow costs
+three requests: roughly twenty flows a minute per IP.
+
+A provider-side failure or a user who declined is not thrown: `finish` returns
+`{ ok: false, error, errorMessage, state }`.
+
+## Server side
+
+Node, with `@aszura/marram-node`:
+
+```ts
+const marram = new Marram({ apiKey, signingSecret });
+
+app.post('/marram/token', requireLogin, async (req, res) => {
+  const { token } = await marram.connectToken({
+    externalUserId: String(req.user.id),
+    redirectUrl: 'https://yourapp.com/connected',
+    expiresIn: 600,
+  });
+  res.json({ token });
+});
+
+// Only with claim: 'server', or for sign-in (signInFlow): the finish endpoint.
+const flow = connectFlow(marram, { providers: ['google'], redirectUrl: 'https://yourapp.com/connected' });
+app.post('/marram/finish', requireLogin, flow.express.finish(async ({ connection }, req) => {
+  await db.markConnected(req.user.id, connection.providerKey);
+  return { connected: true };
+}));
+```
+
+PHP, with `marram/php`:
+
+```php
+$token = $marram->connectToken((string) $user->id, expiresIn: 600, redirectUrl: 'https://yourapp.com/connected')->token;
+
+// Only with claim: 'server', or for sign-in (Marram\SignInFlow): the finish endpoint.
+$flow = new Marram\ConnectFlow($marram, ['google'], 'https://yourapp.com/connected');
+$flow->serveFinish(fn (array $claimed) => saveAndAnswer($claimed));
+```

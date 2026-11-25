@@ -1,0 +1,1723 @@
+openapi: 3.2.0
+
+info:
+  title: Marram API
+  version: 1.0.0
+  summary: Connect your users' third-party accounts and call those APIs without handling their credentials.
+  description: |
+    One host per environment, path-routed. Every path starts with the API version (`/v1`); the
+    sign-in page, the hosted setup form and webhook ingest URLs are unversioned and not part of
+    this document.
+
+    **Errors** are always `{ "error": "…", "code": "…" }`. Branch on `code` (also sent as the
+    `x-marram-error-code` header), never on `error`, which is human-readable text. A code that
+    is just the status as a word (`BAD_REQUEST`, `NOT_FOUND`, …) is generic and may later be
+    refined into a specific one; a specific code never changes meaning.
+
+    **Every response** carries `x-marram-request-id` and `x-marram-timestamp`; responses to
+    authorized requests also carry `x-marram-hmac-256` when signing is on for the environment —
+    except a provider's response relayed by a synchronous proxy call, which is never signed (async
+    proxy callbacks are).
+    The signature is hex HMAC-SHA256 over `timestamp ‖ raw body`, keyed with the environment's
+    base64-decoded signing secret; during a key rotation the header holds two comma-separated
+    signatures and either may match.
+
+    **Rate limit.** Each API key may make about 200 requests per 10 seconds; past that, Marram
+    answers `429` with `RATE_LIMITED` and a `Retry-After` header. It is counted per region and
+    is approximate, so treat it as a ceiling rather than an allowance. Your plan's usage cap is a
+    separate `429`, `LIMIT_EXCEEDED`.
+
+servers:
+  - url: https://api.marram.dev/v1
+    description: Production
+  - url: https://api-staging.marram.dev/v1
+    description: Staging
+
+security:
+  - apiKey: []
+
+tags:
+  - name: setup
+    summary: Setup
+    kind: nav
+    description: Discover what your environment offers.
+  - name: data-access
+    summary: Data access
+    kind: nav
+    description: Connect accounts and call provider APIs on your users' behalf.
+  - name: sign-in
+    summary: Sign-in
+    kind: nav
+    description: Let users sign in to your app with a provider account.
+  - name: status
+    summary: Status
+    parent: setup
+    description: Whether the API is up, for uptime monitors.
+  - name: environment
+    summary: Environment
+    parent: setup
+    description: Read-only information about the caller's environment.
+  - name: connections
+    summary: Connections
+    parent: data-access
+    description: An end user's authorized link to a provider, identified by a connection key.
+  - name: proxy
+    summary: Proxy
+    parent: data-access
+    description: Call a provider's API with the connection's credentials injected.
+  - name: webhooks
+    summary: Webhooks
+    parent: data-access
+    description: Provider webhook subscriptions as a resource.
+  - name: auth
+    summary: Login sessions
+    parent: sign-in
+    description: End-user sign-in through a provider (OAuth2 with PKCE), identified by a session key.
+
+paths:
+  # ─── Status ─────────────────────────────────────────────────────────────────────────────────
+  /status:
+    get:
+      operationId: getStatus
+      tags: [status]
+      summary: Check that the API is up
+      description: |
+        No API key needed, and it touches no data: a `200` means the API is reachable and
+        serving. Poll it from an uptime monitor rather than calling an endpoint that spends your
+        allowance.
+      security: []
+      responses:
+        '200':
+          description: The API is up.
+          headers:
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service, environment, time]
+                properties:
+                  status: { type: string, const: ok }
+                  service: { type: string }
+                  environment: { type: string }
+                  time: { type: string, format: date-time }
+        '4XX': { $ref: '#/components/responses/Error' }
+
+  # ─── Environment ────────────────────────────────────────────────────────────────────────────
+  /environment/integrations:
+    get:
+      operationId: listIntegrations
+      tags: [environment]
+      summary: List the integrations in your environment
+      responses:
+        '200':
+          description: The environment's integrations, with public provider details.
+          headers: &responseHeaders
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+            x-marram-hmac-256: { $ref: '#/components/headers/Signature' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [integrations]
+                properties:
+                  integrations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Integration' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /environment/identity-providers:
+    get:
+      operationId: listIdentityProviders
+      tags: [environment]
+      summary: List the providers enabled for sign-in
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        The providers this environment offers for sign-in, with their active integrations. Accepts
+        the API key, or a connect or sign-in token (`use: "connect"` or `"signin"`), so a page can
+        list its sign-in options without a backend route. Listing doesn't spend the token: the
+        same sign-in token then starts the flow. A token restricted to a `provider` or
+        `integrationKey` lists only what it can start.
+
+        With a token, the answer carries only what a page draws: `providerKey`, `name`,
+        `brandColors`, `brandImages`, and each integration's `integrationKey` and `label`.
+        `status`, `slugs` and `enabled` come back with the API key only.
+
+        Which providers appear depends on their release status and your organization, so this
+        can be shorter than the sign-in integrations in your dashboard.
+      responses:
+        '200':
+          description: Identity providers and their active sign-in integrations.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [identityProviders]
+                properties:
+                  identityProviders:
+                    type: array
+                    items: { $ref: '#/components/schemas/IdentityProvider' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /environment/providers:
+    get:
+      operationId: listProviders
+      tags: [environment]
+      summary: List the providers a user can connect
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        The providers this environment can connect, each with the integrations ready to do it:
+        enabled, with at least one auth type `init` accepts. Made for a logged-in page: with a
+        connect token it answers the browser directly, and each integration says whether the
+        token's user (its `sub`) has connected it, so the page can show "Connect", "Connected" or
+        "Reconnect" (`connectionStatus: reauth_required`). Pass an integration's `integrationKey`
+        and one of its `authTypes` to `init`. Listing doesn't spend the token: the same token then
+        starts the flow.
+
+        With the API key, the user is `x-marram-external-user-id`; without that header the
+        connection fields are null and the list still works. With a token the header is ignored.
+        A token restricted to a `provider` or `integrationKey` lists only what it can connect.
+
+        Which providers appear depends on their release status and your organization, so this
+        can be shorter than `/environment/integrations`. The answer is per user and never cached
+        (`Cache-Control: no-store`), but a list fetched right after a connect can lag it by up to
+        about thirty seconds: trust `claim`'s answer over a reload.
+      parameters:
+        - $ref: '#/components/parameters/externalUserIdHeaderOptional'
+      responses:
+        '200':
+          description: The connectable providers; empty when there are none.
+          headers:
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+            x-marram-hmac-256: { $ref: '#/components/headers/Signature' }
+            Cache-Control:
+              description: Always `no-store`; the list is per user.
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConnectableProvider' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  # ─── Connections ────────────────────────────────────────────────────────────────────────────
+  /connections/{providerSlug}/init:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: initConnection
+      tags: [connections]
+      summary: Start connecting a user's account
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        Returns a `flowId` and an `authorizationUrl` to send the user to: the provider's consent
+        page for OAuth, or Marram's hosted form for field-based auth. Keep the `flowId` next to
+        the PKCE verifier. When the flow finishes, the user lands on your `redirectUrl` with
+        `?status=connected`, or `?error=auth_error&error_message=…` — never a key. The connection
+        is not usable yet: call `claim` with the `flowId` and the verifier for `codeChallenge` to
+        activate it. The user has ten minutes to finish with the provider; after that, the
+        finished connection waits thirty minutes for `claim`.
+
+        A connection belongs to (integration, `externalUserId`) — your own ID for the user.
+        Connecting the same user again overwrites their connection, and the credentials it
+        replaces are revoked at the provider where the provider supports it.
+
+        **Connect tokens.** In place of the API key, the Authorization header may carry a
+        short-lived connect token your backend mints with the environment's signing secret, which
+        lets the browser start the flow directly. The token's `sub` is the `externalUserId` (the
+        body field is ignored) and each token starts exactly one flow. A `redirectUrl` claim in
+        the token is where the user returns (the body field is ignored), and must be http(s)
+        unless the environment's redirect allowlist names it. Without the claim, the body's
+        `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth, codeChallenge, codeChallengeMethod]
+              properties:
+                auth:
+                  $ref: '#/components/schemas/AuthType'
+                redirectUrl:
+                  type: string
+                  format: uri
+                  description: Where the user returns when the flow ends. Required unless a connect token carries it.
+                codeChallenge:
+                  type: string
+                  description: PKCE challenge; keep the verifier where only this user's browser reaches it, for `claim`.
+                codeChallengeMethod: { type: string, const: S256 }
+                externalUserId:
+                  type: string
+                  maxLength: 255
+                  description: |
+                    Your own ID for this user — the connection's identity, with the integration.
+                    Required with an API key; ignored with a connect token, whose `sub` wins. Use
+                    an opaque ID, not an email: it is stored and logged as given.
+                theme:
+                  type: string
+                  enum: [light, dark]
+                  default: light
+      responses:
+        '200':
+          description: The connection is pending; send the user to `authorizationUrl`.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [flowId, authorizationUrl]
+                properties:
+                  flowId:
+                    type: string
+                    description: Names this flow at `claim`; keep it next to the PKCE verifier.
+                  authorizationUrl: { type: string, format: uri }
+                  message: { type: string }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /connections/{providerSlug}/claim:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+    post:
+      operationId: claimConnection
+      tags: [connections]
+      summary: Activate a connection, proving you started it
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        Call once the user is back at your `redirectUrl`, with the `flowId` from `init`, the
+        PKCE verifier for the `codeChallenge` you sent it, and the `claimCode` query parameter
+        the redirect arrived with. The redirect is required: the code is issued after the
+        provider step and reaches only the browser that finished it, which is what stops someone
+        who started a flow from claiming an account another person connected. If the redirect
+        never arrives (a closed tab, a mobile in-app browser), start the flow again. Works once;
+        until it succeeds the connection can't be used, and thirty minutes after the provider
+        step it's gone.
+
+        With an API key the response carries the sanitized connection. With the connect token
+        that started the flow (same `jti`) it carries flow status and the echoed `jti` only —
+        a browser-readable response never includes connection fields. That token may be past its
+        `exp` here: a flow can outlast its token, so claim never answers `CONNECT_TOKEN_EXPIRED`.
+
+        `CONNECTION_NOT_FOUND` (404) means it expired, never completed or was already claimed;
+        `CODE_VERIFIER_MISMATCH` (403) means the verifier isn't the one for this flow;
+        `CLAIM_CODE_MISMATCH` (403) means the `claimCode` isn't the one its redirect carried.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [flowId, codeVerifier, claimCode]
+              properties:
+                flowId: { type: string, description: The flowId `init` returned. }
+                codeVerifier: { type: string, description: The PKCE verifier for `codeChallenge`. }
+                claimCode:
+                  type: string
+                  description: The `claimCode` query parameter on the redirect back to your app.
+      responses:
+        '200':
+          description: The connection is active.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jti]
+                properties:
+                  connection:
+                    $ref: '#/components/schemas/Connection'
+                    description: Present on API-key claims only.
+                  status:
+                    type: string
+                    const: connected
+                    description: Present on token claims, whose body carries no connection fields.
+                  jti:
+                    type: [string, 'null']
+                    description: The starting token's `jti`, to match the result to the token your backend issued; null for API-key-started flows.
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /connections/{providerSlug}/refresh:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: refreshConnection
+      tags: [connections]
+      summary: Refresh a connection's OAuth2 tokens
+      description: |
+        Returns the connection as it stands afterwards. A connection that is still valid for
+        more than a minute is returned unchanged.
+
+        `409` `CONFLICT` means another refresh of the same connection is in progress; retry
+        shortly. `409` `CONNECTION_REAUTH_REQUIRED` means the provider rejected the refresh
+        token: send the user through the connect flow again. `502` `REFRESH_FAILED` and `504`
+        `PROVIDER_TIMEOUT` mean the provider couldn't be reached this time; the connection is
+        unchanged, so retry.
+      responses:
+        '200':
+          description: The refreshed (or still-valid) connection.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connection]
+                properties:
+                  connection: { $ref: '#/components/schemas/Connection' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /connections/{providerSlug}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - name: x-marram-external-user-id
+        in: header
+        description: |
+          The user to disconnect. Required with an API key. Ignored with a connect token, whose
+          `sub` is the user.
+        schema: { $ref: '#/components/schemas/ExternalUserId' }
+      - $ref: '#/components/parameters/integrationKey'
+    delete:
+      operationId: revokeConnection
+      tags: [connections]
+      summary: Revoke and disconnect a connection
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        Revokes the credentials at the provider and clears them from Marram. To restore the
+        connection, the user connects again.
+
+        A connect token disconnects its own user (its `sub`), so a page can offer "Disconnect"
+        without a backend route. It doesn't have to name a `provider`, but if it does, it only
+        disconnects that provider. Each token disconnects once and can't start a flow afterwards,
+        so mint a new one for each click. With a token, the request body is ignored.
+      responses:
+        '200':
+          description: The provider accepted the revoke and the connection is disconnected.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Revoked' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /connections/{providerSlug}/connection:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+    get:
+      operationId: getConnection
+      tags: [connections]
+      summary: Read one user's connection
+      description: |
+        Whether this user is connected, and how the connection is doing. `status` is `active`, or
+        `reauth_required` when the user has to connect again; `lastError` says what went wrong.
+
+        `CONNECTION_NOT_FOUND` (404) means the user hasn't connected, and `CONNECTION_REVOKED`
+        (410) means they disconnected. Reading never refreshes the connection or calls the
+        provider, and it can lag a change by up to about thirty seconds: after a `claim`, trust
+        `claim`'s answer.
+      responses:
+        '200':
+          description: The user's connection.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connection]
+                properties:
+                  connection: { $ref: '#/components/schemas/Connection' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /connections/{providerSlug}/connections:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+    get:
+      operationId: listConnections
+      tags: [connections]
+      summary: List this provider's connections
+      parameters:
+        - name: x-marram-integration-key
+          in: header
+          required: true
+          description: The integration whose connections to list.
+          schema: { $ref: '#/components/schemas/Key' }
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/externalUserId'
+        - $ref: '#/components/parameters/providerUserId'
+        - $ref: '#/components/parameters/credentialStatus'
+      responses:
+        '200':
+          description: One page of this provider's connections in your environment.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [connections, pagination]
+                properties:
+                  connections:
+                    type: array
+                    items: { $ref: '#/components/schemas/Connection' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  # ─── Proxy ──────────────────────────────────────────────────────────────────────────────────
+  /proxy/{providerSlug}/{providerPath}:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - name: providerPath
+        in: path
+        required: true
+        description: |
+          The provider API path, **slashes included** (`1/boards/abc123`). OpenAPI path
+          parameters can't span segments, so generated clients will percent-encode the slashes;
+          build this URL by hand. The query string is forwarded as-is. The path always resolves
+          under the provider's own API host; one that doesn't is `400`.
+        schema: { type: string }
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+      - name: x-marram-version
+        in: header
+        description: |
+          Provider API version label to pin. An unknown label falls back to the default version;
+          check `X-Marram-Version-Served` on the response.
+        schema: { type: string }
+      - name: x-marram-request-type
+        in: header
+        description: |
+          Which of the provider's request templates authenticates this call, named by its type,
+          for a provider whose API takes credentials differently on some endpoints (a separate
+          upload host, an admin API). Without it, the provider's default template is used. A type
+          the provider doesn't define is `404` `MISSING_AUTH_REQUEST_TEMPLATE`.
+        schema: { type: string }
+      - name: x-marram-content-type
+        in: header
+        description: |
+          How the provider should receive a JSON body: Marram re-encodes the JSON you send (for
+          example as a form). On a non-JSON body it only replaces the `Content-Type` the provider
+          sees; the bytes are sent unchanged.
+        schema: { type: string, examples: [application/x-www-form-urlencoded] }
+      - name: x-marram-callback-url
+        in: header
+        description: |
+          Public HTTPS URL. Credentials, usage limit and connection are checked first and any
+          failure is answered directly; then Marram answers `202` and POSTs the provider's
+          response to this URL (see the `proxyCallback` webhook).
+        schema: { type: string, format: uri }
+    # Six operations, one per method; only operationId differs, so the rest is one anchor.
+    get:
+      operationId: proxyGet
+      tags: [proxy]
+      summary: Call the provider (GET)
+      description: &proxyDescription |
+        Marram injects the connection's credentials, forwards the call to the provider's base
+        URL for the served version, and returns the provider's response as it sent it — status,
+        headers and body (secrets redacted). A provider error is not a Marram error: it has no
+        `code` and no `x-marram-error-code` header. Redirects are followed by Marram.
+
+        A successful response is streamed to you as the provider sends it, with no size limit
+        and **no `x-marram-hmac-256`**: a signature has to cover the whole body before the
+        first byte goes out. A text body that had a secret redacted out of it has no
+        `Content-Length`. Provider errors (up to 25 MB) and async calls are read in full first.
+
+        The provider has 60 seconds to answer (12 for an async call); after that Marram answers
+        `504` `PROVIDER_TIMEOUT`. A timeout doesn't mean the provider did nothing, so check
+        before retrying a call that changes data. While a successful response streams, the
+        provider may go 60 seconds without sending anything before Marram ends the connection;
+        the body you received is then incomplete.
+      responses: &proxyResponses
+        '202':
+          description: Async call accepted (`x-marram-callback-url` was set).
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId]
+                properties:
+                  requestId:
+                    { type: string, description: Matches the callback's `x-marram-request-id`. }
+        '2XX':
+          description: |
+            The provider's response, streamed as-is with Marram's headers added. Not signed.
+          headers:
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+            X-Marram-Version-Served: { $ref: '#/components/headers/VersionServed' }
+          content:
+            '*/*':
+              schema: {}
+        '4XX': &proxyError
+          description: |
+            The provider's error, relayed as-is with Marram's headers added and not signed — or
+            a Marram error, recognisable by `x-marram-error-code` and signed like every other
+            Marram answer.
+          headers:
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+            x-marram-hmac-256:
+              description: Present only on a Marram error (one with `x-marram-error-code`).
+              schema: { type: string }
+            x-marram-error-code: { $ref: '#/components/headers/ErrorCode' }
+            X-Marram-Version-Served: { $ref: '#/components/headers/VersionServed' }
+          content:
+            '*/*':
+              schema: {}
+        '5XX': *proxyError
+    post:
+      operationId: proxyPost
+      tags: [proxy]
+      summary: Call the provider (POST)
+      description: *proxyDescription
+      requestBody: &proxyBody
+        description: |
+          **JSON** (`application/json`, any `+json` type, or no `Content-Type`): an object or an
+          array. It reaches the provider exactly as you sent it unless something has to change:
+          the provider's credential template adds fields to the body, or `x-marram-content-type`
+          asks for another encoding. Both need an object; an array in that case is `400`.
+
+          **Anything else** (a file, `multipart/form-data` you built, XML, text, a form) is sent
+          to the provider byte for byte with your `Content-Type`. Marram can't add credentials
+          to it, so a provider that needs them in the body answers `415` `JSON_BODY_REQUIRED`.
+
+          Either kind can be up to 25 MB (`413` above that).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object }
+                - { type: array, items: {} }
+          '*/*':
+            schema: { type: string, format: binary }
+      responses: *proxyResponses
+    put:
+      operationId: proxyPut
+      tags: [proxy]
+      summary: Call the provider (PUT)
+      description: *proxyDescription
+      requestBody: *proxyBody
+      responses: *proxyResponses
+    patch:
+      operationId: proxyPatch
+      tags: [proxy]
+      summary: Call the provider (PATCH)
+      description: *proxyDescription
+      requestBody: *proxyBody
+      responses: *proxyResponses
+    delete:
+      operationId: proxyDelete
+      tags: [proxy]
+      summary: Call the provider (DELETE)
+      description: *proxyDescription
+      requestBody: *proxyBody
+      responses: *proxyResponses
+    head:
+      operationId: proxyHead
+      tags: [proxy]
+      summary: Call the provider (HEAD)
+      description: *proxyDescription
+      responses: *proxyResponses
+
+  # ─── Webhooks ───────────────────────────────────────────────────────────────────────────────
+  /webhooks/{providerSlug}:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: registerWebhook
+      tags: [webhooks]
+      summary: Register a webhook at the provider
+      description: |
+        Creates the subscription at the provider and records it. Events the provider sends are
+        verified and forwarded to your integration's webhook URLs (see the `webhookDelivery`
+        webhook).
+      parameters:
+        - name: x-marram-webhook-kind
+          in: header
+          description: Which of the provider's webhook kinds to register.
+          schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]*$', maxLength: 128 }
+        - name: x-marram-webhook-key
+          in: header
+          description: Choose the webhook key yourself. A few words, such as `init`, are reserved.
+          schema: { $ref: '#/components/schemas/Key' }
+        - name: x-marram-metadata
+          in: header
+          description: |
+            Up to 1 KB of printable ASCII, echoed on every delivery as `x-marram-metadata`.
+          schema: { type: string, maxLength: 1024, pattern: '^[\x20-\x7E]*$' }
+        - $ref: '#/components/parameters/providerVersion'
+      requestBody:
+        description: Kind-specific values the provider's registration call is built from.
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Registered at the provider.
+          headers: &versionedHeaders
+            x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+            x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+            x-marram-hmac-256: { $ref: '#/components/headers/Signature' }
+            X-Marram-Version-Served: { $ref: '#/components/headers/VersionServed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookMutation' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+    get:
+      operationId: listWebhooks
+      tags: [webhooks]
+      summary: List webhooks
+      description: Marram's own records for this integration, filtered to the connection.
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: One page of webhook records.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [webhooks, pagination]
+                properties:
+                  webhooks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Webhook' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /webhooks/{providerSlug}/{webhookKey}:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - name: webhookKey
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Key' }
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+    get:
+      operationId: getWebhook
+      tags: [webhooks]
+      summary: Get one webhook
+      responses:
+        '200':
+          description: The webhook record.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [webhook]
+                properties:
+                  webhook: { $ref: '#/components/schemas/Webhook' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateWebhook
+      tags: [webhooks]
+      summary: Update a webhook at the provider
+      description: |
+        The call goes to the provider with the connection named by
+        `x-marram-external-user-id`, which must be the one the webhook was registered under;
+        any other answers `409 CONFLICT`.
+      parameters:
+        - $ref: '#/components/parameters/providerVersion'
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Updated at the provider.
+          headers: *versionedHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookMutation' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteWebhook
+      tags: [webhooks]
+      summary: Unregister a webhook
+      description: |
+        Unregisters at the provider (a provider `404`/`410` counts as done) and marks the record
+        revoked. For a user's webhook, `x-marram-external-user-id` must name the connection it
+        was registered under; any other answers `409 CONFLICT`.
+
+        Three kinds are cleared in Marram without calling the provider, and answer
+        `unregisteredAtProvider: false`: a manual webhook, which was created in the provider's
+        dashboard, a webhook whose registration the provider never accepted (status `error`),
+        which has nothing at the provider to remove, and any webhook whose connection has been
+        revoked. Revoking a connection
+        doesn't touch its webhooks, because some keep working without the user's grant, and it
+        wipes the credentials a provider call would need. So delete them here when you want them
+        gone, and remove the provider side in the provider's dashboard if it's still there.
+        Deliveries stop as soon as the record is cleared either way.
+      parameters:
+        - $ref: '#/components/parameters/providerVersion'
+      responses:
+        '200':
+          description: Unregistered.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, webhookKey, unregisteredAtProvider]
+                properties:
+                  success: { const: true }
+                  webhookKey: { type: string }
+                  providerWebhookId: { type: [string, 'null'] }
+                  unregisteredAtProvider:
+                    type: boolean
+                    description: |
+                      Whether Marram unregistered the webhook at the provider. `false` for a
+                      manual webhook or a revoked connection's, where the provider may still
+                      hold it, and for a registration the provider never accepted.
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /webhooks/{providerSlug}/init:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/externalUserIdHeader'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: initManualWebhook
+      tags: [webhooks]
+      summary: Start a manual webhook registration
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        For providers whose webhooks are created by hand in their dashboard. Returns the ingest
+        URL to paste there and a hosted `setupUrl` that collects what the dashboard gives back.
+
+        **Connect tokens.** The user does this setup themselves, so the browser may start it with
+        a connect token (`use: "connect"`) in place of the API key. The token's `sub` is the
+        user (the `x-marram-external-user-id` header is ignored), who must already have a
+        connection for the integration. Each token starts one setup; a refused attempt can be
+        retried with the same token. With a token, Marram always picks the `webhookKey`, and
+        `x-marram-webhook-key` and `x-marram-metadata` are refused: start the setup with your
+        API key to set them. The `redirectUrl` follows the same rules as a token-started connect
+        flow: a `redirectUrl` claim in the token wins over the body and must be http(s) unless
+        the environment's redirect allowlist names it. Without the claim, the body's
+        `redirectUrl` must be on that allowlist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [redirectUrl]
+              properties:
+                redirectUrl:
+                  type: string
+                  format: uri
+                  description: Where the hosted setup form returns the user.
+      responses:
+        '200':
+          description: The pending webhook and the fields the hosted setup form asks for.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, sessionId, webhookKey, setupUrl, ingressUrl, status, fields]
+                properties:
+                  success: { const: true }
+                  sessionId: { type: string }
+                  webhookKey: { type: string }
+                  setupUrl: { type: string, format: uri }
+                  ingressUrl: { type: string, format: uri }
+                  status: { const: pending }
+                  fields:
+                    type: array
+                    items: { $ref: '#/components/schemas/FormField' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  # ─── Login sessions ─────────────────────────────────────────────────────────────────────────
+  /auth/{providerSlug}/init:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: initSession
+      tags: [auth]
+      summary: Start a sign-in
+      security:
+        - apiKey: []
+        - connectToken: []
+      description: |
+        **Sign-in tokens.** In place of the API key, the Authorization header may carry a
+        short-lived sign-in token (`use: "signin"`) your backend mints with the environment's
+        signing secret, which lets the browser start the sign-in directly. A `sub`, if present,
+        pins the session to a known user, and each token starts exactly one flow. A `redirectUrl`
+        claim in the token is where the user returns (the body field is ignored), and must be
+        http(s) unless the environment's redirect allowlist names it. Without the claim, the body's
+        `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+        `claim` always takes the API key: the identity must reach your backend straight from
+        Marram, never through the browser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth, codeChallenge, codeChallengeMethod]
+              properties:
+                auth: { type: string, const: oAuth2 }
+                redirectUrl:
+                  type: string
+                  format: uri
+                  description: Where the user returns when the flow ends. Required unless a sign-in token carries it.
+                codeChallenge:
+                  type: string
+                  description: PKCE challenge; keep the verifier for `claim`.
+                codeChallengeMethod: { type: string, const: S256 }
+                externalUserId: { type: [string, 'null'] }
+                theme: { type: string, enum: [light, dark], default: light }
+      responses:
+        '200':
+          description: The session is pending; send the user to `authorizationUrl`.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionKey, authorizationUrl]
+                properties:
+                  sessionKey: { type: string }
+                  authorizationUrl: { type: string, format: uri }
+                  message: { type: string }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/claim:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/sessionKey'
+    post:
+      operationId: claimSession
+      tags: [auth]
+      summary: Read the signed-in user, proving you started the flow
+      description: |
+        Activates the session and returns the user, with the `sessionKey` from `init` (or the
+        redirect URL), the PKCE verifier and the `claimCode` query parameter the redirect
+        arrived with. The redirect is required, as for connections: only the browser that
+        finished the provider step receives the code. Works once; thirty minutes after the
+        provider step an unclaimed sign-in is gone.
+        `SESSION_NOT_FOUND` (404) means it expired, never completed or was already claimed;
+        `CODE_VERIFIER_MISMATCH` (403) means the verifier isn't the one for this session;
+        `CLAIM_CODE_MISMATCH` (403) means the `claimCode` isn't the one its redirect carried.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [codeVerifier, claimCode]
+              properties:
+                codeVerifier: { type: string, description: The PKCE verifier for `codeChallenge`. }
+                claimCode:
+                  type: string
+                  description: The `claimCode` query parameter on the redirect back to your app.
+      responses:
+        '200':
+          description: The user's identity.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserInfo' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/userinfo:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/sessionKey'
+      - $ref: '#/components/parameters/integrationKey'
+    post:
+      operationId: getSessionUser
+      tags: [auth]
+      summary: Fetch the user for an active session
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: The user's identity, fetched live from the provider.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserInfo' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/refresh:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/sessionKey'
+    post:
+      operationId: refreshSession
+      tags: [auth]
+      summary: Refresh a session's tokens
+      description: |
+        `409` `CONFLICT` means another refresh of the same session is in progress; retry shortly.
+        `409` `SESSION_REAUTH_REQUIRED` means the provider rejected the refresh token: sign the
+        user in again. `502` `REFRESH_FAILED` and `504` `PROVIDER_TIMEOUT` mean the provider
+        couldn't be reached this time; the session is unchanged, so retry.
+      responses:
+        '200':
+          description: The refreshed (or still-valid) session.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: '#/components/schemas/Session' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/sessionKey'
+      - $ref: '#/components/parameters/integrationKey'
+    delete:
+      operationId: revokeSession
+      tags: [auth]
+      summary: Revoke a session
+      responses:
+        '200':
+          description: The provider accepted the revoke.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Revoked' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/session:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - $ref: '#/components/parameters/sessionKey'
+    get:
+      operationId: getSession
+      tags: [auth]
+      summary: Read one session
+      description: |
+        How a session is doing, without calling the provider. `status` is `active`, or
+        `reauth_required` when the user has to sign in again; `lastError` says what went wrong.
+        For the user's identity, call `userinfo`.
+
+        `SESSION_NOT_FOUND` (404) means no session has this key, and `SESSION_REVOKED` (410) means
+        it was revoked. Reading never refreshes the session.
+      responses:
+        '200':
+          description: The session.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: '#/components/schemas/Session' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+  /auth/{providerSlug}/sessions:
+    parameters:
+      - $ref: '#/components/parameters/providerSlug'
+      - name: x-marram-integration-key
+        in: header
+        description: Optional. Narrows the list to one integration.
+        schema: { $ref: '#/components/schemas/Key' }
+    get:
+      operationId: listSessions
+      tags: [auth]
+      summary: List this provider's sessions
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/externalUserId'
+        - $ref: '#/components/parameters/providerUserId'
+        - $ref: '#/components/parameters/credentialStatus'
+      responses:
+        '200':
+          description: One page of this provider's sessions in your environment.
+          headers: *responseHeaders
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, pagination]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Session' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '4XX': { $ref: '#/components/responses/Error' }
+        '5XX': { $ref: '#/components/responses/Error' }
+
+webhooks:
+  webhookDelivery:
+    post:
+      operationId: webhookDelivery
+      summary: A provider event, delivered to your integration's webhook URLs
+      description: |
+        Verify `x-marram-hmac-256` exactly as for API responses. Every attempt is signed
+        afresh, so its `x-marram-timestamp` is the attempt's, not the event's.
+
+        Answer `2XX` within 10 seconds. Anything else (another status, a timeout, a refused
+        connection) is retried: once a second later, then after about 1 minute, 5 minutes,
+        30 minutes, 2 hours, 6 hours, 12 hours, 24 hours and 24 hours, roughly three days in all.
+        Retries go to the URL as it is configured when they run; remove or switch off a URL and
+        its pending retries stop. Retries can arrive out of order, so dedupe on
+        `x-marram-delivery-id`, which is the same on every attempt.
+      parameters:
+        - { name: x-marram-webhook-key, in: header, required: true, schema: { type: string } }
+        - {
+            name: x-marram-delivery-id,
+            in: header,
+            required: true,
+            description: The same on every attempt at one delivery.,
+            schema: { type: string },
+          }
+        - {
+            name: x-marram-delivery-attempt,
+            in: header,
+            required: true,
+            description: 1 on the first attempt.,
+            schema: { type: integer, minimum: 1 },
+          }
+        - { name: x-marram-provider, in: header, required: true, schema: { type: string } }
+        - { name: x-marram-provider-slug, in: header, required: true, schema: { type: string } }
+        - { name: x-marram-metadata, in: header, schema: { type: string } }
+        - {
+            name: x-marram-timestamp,
+            in: header,
+            required: true,
+            schema: { type: string, format: date-time },
+          }
+        - { name: x-marram-hmac-256, in: header, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '2XX': { description: Accepted. Any other answer is retried on the schedule above. }
+
+  proxyCallback:
+    post:
+      operationId: proxyCallback
+      summary: The provider's response to an async proxy call
+      description: |
+        The body and headers are the provider's (secrets redacted), and `x-marram-status` is
+        the status the call would have returned had it been synchronous. `x-marram-request-id`
+        matches the `requestId` from the `202`. When Marram could not complete the call, the
+        body is a Marram error and `x-marram-error-code` names it. Answer within 4 seconds.
+      parameters:
+        - { name: x-marram-request-id, in: header, required: true, schema: { type: string } }
+        - name: x-marram-status
+          in: header
+          required: true
+          description: The provider's HTTP status, or Marram's own when `x-marram-error-code` is set.
+          schema: { type: integer }
+        - name: x-marram-error-code
+          in: header
+          description: Present only when the body is a Marram error rather than the provider's response.
+          schema: { $ref: '#/components/schemas/ErrorCode' }
+        - {
+            name: x-marram-timestamp,
+            in: header,
+            required: true,
+            schema: { type: string, format: date-time },
+          }
+        - { name: x-marram-hmac-256, in: header, schema: { type: string } }
+      requestBody:
+        content:
+          '*/*':
+            schema: {}
+      responses:
+        '2XX':
+          description: |
+            Accepted. A `5XX`, a timeout or a network error is tried again, up to three attempts
+            in all, a few seconds apart; a `4XX` is not retried.
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: |
+        Your secret API key. Keep it server-side: every call is made from your backend. It is
+        `sk_<random>_<organizationId>_<environmentId>`, four underscore-separated parts; treat
+        the whole string as opaque.
+    connectToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A short-lived, browser-facing token your backend mints locally — no API call — with the
+        environment's signing secret, accepted only where an operation lists it: starting and
+        claiming a connect flow, disconnecting a connection, starting a manual webhook setup,
+        listing the providers a user can connect or sign in with, and starting a sign-in. It is a compact HS256 JWT whose key is
+        the base64-decoded signing secret (the previous secret also verifies during a rotation).
+        Claims: `typ: "marram"`, `use: "connect"` or `"signin"`, `sub` (the externalUserId —
+        required for connect, optional for sign-in), `env` and `org` (the environment and
+        organization ULIDs from your API key), optional `provider` and `integrationKey`
+        restrictions, an optional `redirectUrl`, `iat`, `exp` (at most 10 minutes after `iat`;
+        about 60 seconds of clock skew is allowed), and a unique `jti`. Each `jti` acts exactly
+        once: a successful `init` (connect, sign-in or manual webhook) or `revoke` spends it, so one token can list providers and
+        then start, and a refused attempt can be retried with the same token. A
+        token-started flow needs a `redirectUrl` claim, or a body `redirectUrl` on the
+        environment's redirect allowlist; with an allowlist set, a claim must match it too. The
+        SDKs' `connectToken()` / `signInToken()` mint these for you.
+
+  parameters:
+    providerSlug:
+      name: providerSlug
+      in: path
+      required: true
+      description: The provider, e.g. `trello` or `google-calendar`.
+      schema: { type: string, pattern: '^[a-z0-9]+(-[a-z0-9]+)*$' }
+    integrationKey:
+      name: x-marram-integration-key
+      in: header
+      description: Only needed when the provider has several integrations and no default.
+      schema: { $ref: '#/components/schemas/Key' }
+    externalUserIdHeader:
+      name: x-marram-external-user-id
+      in: header
+      required: true
+      description: Your own ID for the user whose connection to act as.
+      schema: { $ref: '#/components/schemas/ExternalUserId' }
+    externalUserIdHeaderOptional:
+      name: x-marram-external-user-id
+      in: header
+      description: |
+        With an API key, the user whose connections to report; leave it out to list without them.
+        Ignored with a connect token, whose `sub` is the user.
+      schema: { $ref: '#/components/schemas/ExternalUserId' }
+    sessionKey:
+      name: x-marram-session-key
+      in: header
+      required: true
+      schema: { $ref: '#/components/schemas/Key' }
+    page:
+      name: page
+      in: query
+      description: Which page, from 1. Ask for the next one while `pagination.hasMore` is true.
+      schema: { type: integer, minimum: 1, default: 1 }
+    limit:
+      name: limit
+      in: query
+      description: Items per page.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    externalUserId:
+      name: externalUserId
+      in: query
+      description: Only the ones with this `externalUserId`, your own ID for the user.
+      schema: { type: string }
+    providerUserId:
+      name: providerUserId
+      in: query
+      description: Only the ones for this account at the provider.
+      schema: { type: string }
+    credentialStatus:
+      name: status
+      in: query
+      description: Only the ones in this status.
+      schema: { $ref: '#/components/schemas/CredentialStatus' }
+    providerVersion:
+      name: x-marram-version
+      in: header
+      description: Provider API version label; unknown labels fall back to the default.
+      schema: { type: string }
+
+  schemas:
+    Key:
+      type: string
+      minLength: 1
+      maxLength: 255
+    ExternalUserId:
+      type: string
+      minLength: 1
+      maxLength: 255
+      description: Your own ID for a user — opaque, printable ASCII; stored and logged as given.
+    AuthType:
+      type: string
+      enum: [oAuth1, oAuth2, api_key, basic, session]
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: { type: string, description: Human-readable; may change. }
+        code: { $ref: '#/components/schemas/ErrorCode' }
+      additionalProperties: true
+    ErrorCode:
+      type: string
+      description: |
+        Stable; branch on this. New codes may be added: treat a code you do not know like its
+        status. The first fourteen are generic — the status as a word — and may later be refined.
+      enum:
+        - BAD_REQUEST
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - NOT_FOUND
+        - METHOD_NOT_ALLOWED
+        - CONFLICT
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - UNPROCESSABLE
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+        - BAD_GATEWAY
+        - UNAVAILABLE
+        - GATEWAY_TIMEOUT
+        - MISSING_CREDENTIALS
+        - INVALID_API_KEY_FORMAT
+        - INVALID_API_KEY
+        - API_KEY_EXPIRED
+        - IP_NOT_ALLOWED
+        - ENVIRONMENT_NOT_FOUND
+        - LIMIT_EXCEEDED
+        - PROVIDER_NOT_FOUND
+        - INTEGRATION_NOT_FOUND
+        - INTEGRATION_KEY_REQUIRED
+        - INVALID_INTEGRATION_KEY
+        - CONNECTION_NOT_FOUND
+        - SESSION_NOT_FOUND
+        - IDENTITY_NOT_FOUND
+        - WEBHOOK_NOT_FOUND
+        - MISSING_CONNECTION_KEY
+        - MISSING_EXTERNAL_USER_ID
+        - MISSING_FLOW_ID
+        - MISSING_SESSION_KEY
+        - MISSING_REDIRECT_URL
+        - MISSING_AUTH
+        - MISSING_AUTH_TYPE
+        - AUTH_TYPE_MISMATCH
+        - AUTH_TYPE_NOT_SUPPORTED
+        - MISSING_PROVIDER_HEADERS
+        - MISSING_PROVIDER_VERSION
+        - UNADDRESSED_ARRAY_ITEMS
+        - UNRESOLVED_PATH_TOKEN
+        - BLOCKED_PATH
+        - TOO_MANY_REDIRECTS
+        - JSON_BODY_REQUIRED
+        - INVALID_CONNECT_TOKEN
+        - CONNECT_TOKEN_EXPIRED
+        - CONNECT_TOKEN_REUSED
+        - CONNECT_TOKEN_WRONG_USE
+        - REDIRECT_URL_NOT_ALLOWED
+        - MISSING_PKCE_PARAMETERS
+        - UNSUPPORTED_CODE_CHALLENGE_METHOD
+        - MISSING_CODE_VERIFIER
+        - CODE_VERIFIER_MISMATCH
+        - NO_CODE_CHALLENGE
+        - MISSING_CLAIM_CODE
+        - CLAIM_CODE_MISMATCH
+        - MISSING_TEMP_CONNECTION_KEY
+        - MISSING_TEMP_SESSION_KEY
+        - TEMP_CONNECTION_NOT_FOUND
+        - TEMP_SESSION_NOT_FOUND
+        - TEMP_WEBHOOK_NOT_FOUND
+        - CONNECTION_INIT_FAILED
+        - SESSION_INIT_FAILED
+        - AUTH_NOT_FOUND
+        - NO_AUTH_CONFIGURED
+        - NO_INTEGRATION_AUTHS
+        - NO_PROVIDER_IDENTITIES
+        - NO_REVOKE_CONFIG
+        - NO_USER_CONFIG
+        - MISSING_AUTH_CONFIG
+        - MISSING_AUTH_REQUEST_TEMPLATE
+        - MISSING_DEFAULT_AUTH_REQUEST_TEMPLATE_ID
+        - MISSING_PROVIDER_AUTH_ID
+        - MISSING_CONNECTION_FIELDS
+        - MISSING_WEBHOOK_FIELDS
+        - MISSING_RETURN_URL
+        - FIELD_TRANSFORM_FAILED
+        - USER_URL_TEMPLATE_FAILED
+        - REVOKE_URL_TEMPLATE_FAILED
+        - PROVIDER_UNREACHABLE
+        - PROVIDER_TIMEOUT
+        - PROVIDER_RESPONSE_TOO_LARGE
+        - AUTHORIZATION_URL_FAILED
+        - REQUEST_TOKEN_FAILED
+        - TOKEN_EXCHANGE_FAILED
+        - AUTHORIZATION_DENIED
+        - REFRESH_FAILED
+        - INFO_REQUEST_FAILED
+        - INFO_REQUEST_ERROR
+        - USERINFO_REQUEST_FAILED
+        - USERINFO_REQUEST_ERROR
+        - REVOKE_REQUEST_FAILED
+        - REVOKE_REQUEST_ERROR
+        - CONNECTIONS_LOOKUP_ERROR
+        - CONNECTIONS_LOOKUP_FAILED
+        - SESSIONS_LOOKUP_ERROR
+        - SESSIONS_LOOKUP_FAILED
+        - WEBHOOKS_NOT_SUPPORTED
+        - MANUAL_WEBHOOKS_NOT_SUPPORTED
+        - WEBHOOK_NOT_MANUAL
+        - WEBHOOK_KEY_UNAVAILABLE
+        - WEBHOOK_KIND_NOT_FOUND
+        - WEBHOOK_OPERATION_NOT_SUPPORTED
+        - WEBHOOK_CONFIG_GONE
+        - WEBHOOK_CONFIG_NO_METHOD
+        - WEBHOOK_CONFIG_NO_PATH
+        - WEBHOOK_CONFIG_NO_INCOMING
+        - WEBHOOK_INGRESS_URL_UNKNOWN
+        - WEBHOOK_LIST_FAILED
+        - API_KEY_REVOKED
+        - INTEGRATION_DISABLED
+        - ENVIRONMENT_DISABLED
+        - PROVIDER_DISABLED
+        - CONNECTION_REVOKED
+        - SESSION_REVOKED
+        - CONNECTION_REAUTH_REQUIRED
+        - SESSION_REAUTH_REQUIRED
+        - PROVIDER_REJECTED
+    Pagination:
+      type: object
+      required: [page, limit, hasMore]
+      properties:
+        page: { type: integer, minimum: 1 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        hasMore:
+          type: boolean
+          description: Whether another page may follow. It can be true when the next page is empty.
+    Revoked:
+      type: object
+      required: [revoked]
+      properties:
+        revoked: { const: true }
+
+    Connection:
+      type: object
+      required:
+        [externalUserId, providerKey, integrationKey, authType, status, createdAt, updatedAt]
+      properties:
+        providerKey: { type: string }
+        integrationKey: { type: string }
+        externalUserId:
+          type: string
+          description: Your own ID for the user — with the integration, the connection's identity.
+        providerUserId: { type: [string, 'null'] }
+        authType: { type: string }
+        status: { $ref: '#/components/schemas/CredentialStatus' }
+        grantedScopes: { type: [array, 'null'] }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        lastRefreshedAt: { type: [string, 'null'], format: date-time }
+        lastUsedAt: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+        lastErrorAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        disconnectedAt: { type: [string, 'null'], format: date-time }
+    Session:
+      type: object
+      required: [sessionKey, providerKey, integrationKey, authType, status, createdAt, updatedAt]
+      properties:
+        sessionKey: { type: string }
+        providerKey: { type: string }
+        integrationKey: { type: string }
+        externalUserId: { type: [string, 'null'] }
+        providerUserId: { type: [string, 'null'] }
+        authType: { type: string }
+        status: { $ref: '#/components/schemas/CredentialStatus' }
+        grantedScopes: { type: [array, 'null'] }
+        expiresAt: { type: [string, 'null'], format: date-time }
+        lastRefreshedAt: { type: [string, 'null'], format: date-time }
+        lastUsedAt: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+        lastErrorAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        disconnectedAt: { type: [string, 'null'], format: date-time }
+    CredentialStatus:
+      type: string
+      enum: [active, pending, reauth_required, error, revoked, inactive]
+    UserInfo:
+      type: object
+      required: [user, raw]
+      properties:
+        user:
+          type: object
+          additionalProperties: true
+          description: The fields the identity config maps (e.g. `email`, `name`).
+        raw:
+          type: object
+          additionalProperties: true
+          description: The provider's userinfo response, secrets redacted.
+        jti:
+          type: [string, 'null']
+          description: |
+            On `claim` only: the starting sign-in token's `jti`, to match this identity to the
+            token your backend issued (like an OIDC nonce); null for API-key-started flows.
+    Integration:
+      type: object
+      required: [integrationId, providerId, providerKey, integrationKey, label]
+      properties:
+        integrationId: { type: string }
+        providerId: { type: string }
+        providerKey: { type: string }
+        integrationKey: { type: string }
+        label: { type: string }
+        status: { type: string }
+        enabled: { type: boolean }
+        auths: { type: array, items: { type: string } }
+        scopes:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+        scopesByGroups:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+        scopeIds: { type: array, items: { type: string } }
+        webhookUrls:
+          type: array
+          items: { $ref: '#/components/schemas/IntegrationWebhookUrl' }
+        deleteAt: { type: [string, 'null'], format: date-time }
+        provider:
+          oneOf:
+            - $ref: '#/components/schemas/ProviderSummary'
+            - type: 'null'
+    ProviderSummary:
+      type: object
+      properties:
+        name: { type: string }
+        status: { type: string }
+        slugs:
+          type: array
+          items:
+            type: object
+            properties:
+              slug: { type: string }
+              version: { type: string }
+        brandColors:
+          type: array
+          items: { $ref: '#/components/schemas/BrandColor' }
+        brandImages:
+          type: array
+          items: { $ref: '#/components/schemas/BrandImage' }
+    BrandColor:
+      type: object
+      required: [providerBrandColorId, name, role, hex]
+      properties:
+        providerBrandColorId: { type: string }
+        name: { type: string }
+        role: { type: string }
+        hex: { type: string }
+    BrandImage:
+      type: object
+      required: [providerBrandImageId, url, type, theme, color, description, sortOrder]
+      properties:
+        providerBrandImageId: { type: string }
+        url: { type: string, format: uri }
+        type: { type: string }
+        theme: { type: string }
+        color: { type: string }
+        description: { type: string }
+        sortOrder: { type: number }
+    IntegrationWebhookUrl:
+      type: object
+      required: [integrationWebhookUrlId, url]
+      properties:
+        integrationWebhookUrlId: { type: string }
+        url: { type: string, format: uri }
+        isActive: { type: boolean }
+    IdentityProvider:
+      description: A token caller gets no `status`, `slugs` or `enabled`.
+      allOf:
+        - $ref: '#/components/schemas/ProviderSummary'
+        - type: object
+          properties:
+            providerKey: { type: string }
+            integrations:
+              type: array
+              items:
+                type: object
+                properties:
+                  integrationKey: { type: string }
+                  label: { type: string }
+                  enabled: { type: boolean, description: API key only. }
+    ConnectableProvider:
+      type: object
+      description: A provider with at least one integration a user can connect.
+      required: [providerKey, name, brandColors, brandImages, integrations]
+      properties:
+        providerKey: { type: string, description: What `init` takes as the provider. }
+        name: { type: string }
+        brandColors:
+          type: array
+          items: { $ref: '#/components/schemas/BrandColor' }
+        brandImages:
+          type: array
+          items: { $ref: '#/components/schemas/BrandImage' }
+        integrations:
+          type: array
+          minItems: 1
+          description: Usually one. Each entry is a separate connection for the user.
+          items: { $ref: '#/components/schemas/ConnectableIntegration' }
+    ConnectableIntegration:
+      type: object
+      required: [integrationKey, label, authTypes, connected, connectionStatus]
+      properties:
+        integrationKey:
+          type: string
+          description: Send it as `x-marram-integration-key` to `init`; the list doesn't say which one is the default.
+        label: { type: string }
+        authTypes:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: The values `init` accepts as `auth` for this integration, e.g. `["oAuth2"]`.
+        connected:
+          type: boolean
+          description: True when `connectionStatus` is `active`.
+        connectionStatus:
+          oneOf:
+            - $ref: '#/components/schemas/CredentialStatus'
+            - type: 'null'
+          description: |
+            The user's connection to this integration, or null when there is none (or no user
+            was named). `reauth_required` means a reconnect is needed. An expired access token
+            still reads `active`: the proxy refreshes it on use.
+    Webhook:
+      type: object
+      required: [webhookKey, status, createdAt, updatedAt]
+      properties:
+        webhookKey: { type: string }
+        kind: { type: [string, 'null'] }
+        status: { type: string }
+        providerWebhookId: { type: [string, 'null'] }
+        externalUserId: { type: [string, 'null'] }
+        metadata: { type: [string, 'null'] }
+        webhookData: { type: object, additionalProperties: true }
+        registeredAt: { type: [string, 'null'], format: date-time }
+        lastError: { type: [string, 'null'] }
+        lastErrorAt: { type: [string, 'null'], format: date-time }
+        lastDeliveredAt:
+          type: [string, 'null']
+          format: date-time
+          description: When an event last reached one of your webhook URLs, to within a minute; null until one has.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    WebhookMutation:
+      type: object
+      required: [success, webhookKey]
+      properties:
+        success: { const: true }
+        webhookKey: { type: string }
+        providerWebhookId: { type: [string, 'null'] }
+        kind: { type: [string, 'null'] }
+    FormField:
+      type: object
+      description: One input on the hosted setup form; webhook fields first, then connection fields.
+      required: [keyVal, name, type, required, isSecret]
+      properties:
+        providerWebhookFieldId: { type: string }
+        providerConnectionFieldId: { type: string }
+        keyVal: { type: string, description: The key to send the value under. }
+        name: { type: string }
+        type: { type: string }
+        inputType: { type: string }
+        helpUrl: { type: [string, 'null'] }
+        fillStage: { type: string }
+        defaultValue: {}
+        deprecated: { type: boolean }
+        required: { type: boolean }
+        validationRules: {}
+        isSecret: { type: boolean }
+        sort: { type: number }
+        allowHidden: { type: boolean }
+        allowPrefill: { type: boolean }
+        translations: {}
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              value: {}
+              translations: {}
+            additionalProperties: true
+      additionalProperties: true
+
+  headers:
+    RequestId:
+      description: Names this request in Marram's logs; quote it when asking for help.
+      schema: { type: string }
+    Timestamp:
+      description: When the response was produced; signed together with the body.
+      schema: { type: string, format: date-time }
+    Signature:
+      description: Hex HMAC-SHA256 over `timestamp ‖ body`; two comma-separated values during a key rotation.
+      schema: { type: string }
+    ErrorCode:
+      description: The same `code` as the body. Present only on Marram's own errors — a proxied provider error never has it.
+      schema: { type: string }
+    VersionServed:
+      description: The provider API version Marram used (`default` when unpinned).
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: |
+        A Marram error. Common codes: `MISSING_CREDENTIALS`, `INVALID_API_KEY`,
+        `API_KEY_EXPIRED`, `IP_NOT_ALLOWED` (401);
+        `MISSING_CONNECTION_KEY`, `MISSING_SESSION_KEY`, `INTEGRATION_KEY_REQUIRED` (400);
+        `PROVIDER_NOT_FOUND`, `INTEGRATION_NOT_FOUND`, `CONNECTION_NOT_FOUND` (404);
+        `METHOD_NOT_ALLOWED` (405, with an `Allow` header); `CONFLICT` (409);
+        `LIMIT_EXCEEDED`, `RATE_LIMITED` (429; `RATE_LIMITED` carries `Retry-After`);
+        `PROVIDER_UNREACHABLE`, `REFRESH_FAILED`, `PROVIDER_RESPONSE_TOO_LARGE` (502; the last
+        for a provider response over 25 MB); `PROVIDER_TIMEOUT` (504).
+      headers:
+        x-marram-request-id: { $ref: '#/components/headers/RequestId' }
+        x-marram-timestamp: { $ref: '#/components/headers/Timestamp' }
+        x-marram-hmac-256: { $ref: '#/components/headers/Signature' }
+        x-marram-error-code: { $ref: '#/components/headers/ErrorCode' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

@@ -1,0 +1,312 @@
+# @aszura/marram-node
+
+> Marram API client for server-side JavaScript (Node.js 20+, Deno, Bun, edge workers). Connects
+> end users' third-party accounts, calls those providers' APIs through Marram, manages provider
+> webhooks, and signs users in with OAuth2. Holds the secret API key: server-side only.
+
+This file is for AI coding assistants. Follow the rules first; the reference follows.
+
+## Rules
+
+1. **Server only.** `new Marram({ apiKey })` takes the secret key. Never import this package in
+   browser or mobile code; use `@aszura/marram-browser` there, with a token your server mints.
+2. **Connections belong to your user ID.** `connections.init` requires `externalUserId` — your own
+   opaque ID for the user — and every later proxy, refresh, revoke and webhook call addresses the
+   connection with that same ID. There is no Marram key to persist. Reconnecting the same user
+   replaces their connection.
+3. **PKCE on every connect and sign-in.** `connections.init` / `sessions.init` take a
+   `codeChallenge`; `claim` needs the matching `codeVerifier`, the `claimCode` query parameter
+   the redirect arrived with — and for connections the `flowId` init returned. The connection or
+   session is not live until claimed. Keep the flowId and verifier together where only the
+   starting user's browser reaches them (their server session, or the browser's `sessionStorage`
+   via `@aszura/marram-browser`). A connect redirect carries `?status=connected&claimCode=…` —
+   never a key. The `claimCode` is one-time and exists only in that redirect, so a flow can only be
+   claimed from it.
+4. **Claim once.** `claim` is single-use and expires 30 minutes after the provider step. Delete the
+   stored verifier before or right after claiming.
+5. **Set `auth`, `redirectUrl` and the provider on the server.** If the browser picks a provider,
+   check it against an allowlist.
+6. **Branch on `error.code`, never `error.message`.** Unknown codes: fall back to `error.status`.
+7. **Proxy responses are the provider's.** `proxy.fetch` returns a `Response` for every provider
+   status (4xx/5xx included). Check `response.ok` yourself. Only Marram's own refusals throw.
+   The body streams (no size limit) and is **not signed**: don't run `verifyResponse` on it.
+8. **Verify webhooks with the raw body**, before any JSON parsing. A re-serialized body won't verify.
+9. **Finish endpoint for `@aszura/marram-browser`? Use `connectFlow` / `signInFlow`.** Their
+   `finish` handlers serve a sign-in, or a connect started with `claim: 'server'`, with Express and
+   web-standard (`Request` → `Response`) handlers. Don't store the provider in a session: the
+   browser sends it with the finish payload. The package no longer calls their `start` handlers,
+   which remain for browser code you write yourself.
+10. **The browser package starts every flow with a token.** `marram.connectToken({ externalUserId })` /
+    `marram.signInToken()` (needs `signingSecret` in the client options) mint a short-lived
+    token locally — no API call — and the browser runs the flow directly against Marram with
+    `connect(provider, { token })` / `signIn(provider, { token })`. One token starts exactly one
+    flow, does one browser `disconnect`, or starts one browser `setUpWebhook` (manual webhook
+    setup); it can still claim its flow after it expires. Pass
+    `redirectUrl` when minting (no dashboard setup needed); without it the page's URL
+    must be on the environment's redirect allowlist, and a set allowlist binds the token's URL too.
+    Don't sign a URL taken from the browser unchecked. Sign-in claims always stay on your server
+    with the API key.
+
+## Install and create a client
+
+```ts
+// npm install @aszura/marram-node
+import { Marram } from '@aszura/marram-node';
+
+const marram = new Marram({
+  apiKey: process.env.MARRAM_API_KEY!,
+  // environment: 'staging',            // default 'production'
+  // baseUrl: 'https://…/v1',            // overrides environment; include /v1
+  // signingSecret: process.env.MARRAM_SIGNING_SECRET, // for connectToken()/signInToken()
+  // fetch: customFetch,                 // default globalThis.fetch
+});
+```
+
+Base URLs: production `https://api.marram.dev/v1`, staging `https://api-staging.marram.dev/v1`
+(exported as `BASE_URLS`).
+
+## Connect a user's account (server-side PKCE)
+
+```ts
+import { createPkce, parseConnectionRedirect } from '@aszura/marram-node';
+
+// Start, e.g. POST /connect/google, behind your login:
+const pkce = await createPkce();
+const { flowId, authorizationUrl } = await marram.connections.init('google', {
+  auth: 'oAuth2',
+  redirectUrl: 'https://yourapp.com/connected',
+  codeChallenge: pkce.codeChallenge,
+  codeChallengeMethod: pkce.codeChallengeMethod, // 'S256'
+  externalUserId: user.id,                       // required: your opaque user id
+});
+req.session.marramConnect = { flowId, codeVerifier: pkce.codeVerifier };
+res.redirect(authorizationUrl);
+
+// Return, GET /connected (lands with ?status=connected&claimCode=…), same browser session:
+const result = parseConnectionRedirect(fullRequestUrl);
+const pendingFlow = req.session.marramConnect;
+delete req.session.marramConnect;
+if (result.ok && pendingFlow) {
+  const connection = await marram.connections.claim('google', pendingFlow.flowId, pendingFlow.codeVerifier, result.claimCode);
+  await db.markConnected(user.id, connection.providerKey); // address it by user.id from now on
+} else if (!result.ok) {
+  // result.error, result.errorMessage: user declined or provider failed
+}
+```
+
+## Serve `@aszura/marram-browser` (browser-side PKCE)
+
+The browser package starts flows with a token you mint (below). A sign-in, or a connect started
+with `claim: 'server'`, also needs a finish endpoint; mount `connectFlow` / `signInFlow`'s `finish`
+rather than writing it. Their `start` handlers remain for browser code you write yourself.
+
+```ts
+import { Marram, connectFlow, signInFlow } from '@aszura/marram-node';
+
+const connect = connectFlow(marram, {
+  providers: ['google', 'trello'],          // allowlist; or { trello: { integrationKey: '…', auth: 'oAuth1' } }
+  redirectUrl: 'https://yourapp.com/connected', // or (provider) => string
+  // auth: 'oAuth2', theme: 'light' | 'dark'
+});
+
+// Express / Next.js API routes (after express.json() and your login middleware):
+app.post('/marram/start', requireLogin, connect.express.start((req) => ({ externalUserId: req.user.id })));
+app.post('/marram/finish', requireLogin, connect.express.finish(async ({ connection }, req) => {
+  await db.markConnected(req.user.id, connection.providerKey);
+  return { connected: true };               // answered as JSON; undefined answers { ok: true }
+}));
+
+// Next.js App Router / Remix / Hono / SvelteKit / Workers (Request in, Response out):
+export const POST = connect.web.start(async (request) => ({ externalUserId: (await currentUser(request)).id }));
+export const POST = connect.web.finish(async ({ connection }, request) => { /* save; may throw a Response */ });
+
+// Any framework:
+const started = await connect.start(req.body, { externalUserId }); // { provider, flowId, authorizationUrl }
+const claimed = await connect.finish(req.body);                    // { provider, flowId, connection }
+```
+
+`connectFlow.start` requires `externalUserId` in its init (the connection's identity) and refuses
+to start without one. `signInFlow(marram, options)` is the same for sign-in: start answers
+`{ provider, sessionKey, authorizationUrl }`, finish gives `{ provider, sessionKey, user, raw }`.
+
+Input: start takes `{ provider, codeChallenge, codeChallengeMethod: 'S256' }`, finish takes
+`{ provider, flowId | sessionKey, codeVerifier, claimCode }`, exactly what the browser package sends.
+Bad input throws `FlowInputError` (`status` 400, `code` `UNKNOWN_PROVIDER` | `INVALID_INPUT`).
+The handlers answer `{ code, error, requestId? }`: 400 for bad input or a claim Marram refused
+(`CONNECTION_NOT_FOUND`, `SESSION_NOT_FOUND`, `CODE_VERIFIER_MISMATCH`, `MISSING_PKCE_PARAMETERS`,
+`CLAIM_CODE_MISMATCH`, `MISSING_CLAIM_CODE`),
+502 for any other `MarramError`; anything else goes to `next(error)` / rethrows.
+`flowErrorReply(error)` gives that `{ status, body }` (or null) for your own handlers.
+`connect.providers` lists the allowlist.
+
+## Sign users in
+
+```ts
+const pkce = await createPkce();
+const { sessionKey, authorizationUrl } = await marram.sessions.init('google', {
+  auth: 'oAuth2',
+  redirectUrl: 'https://yourapp.com/signed-in',
+  codeChallenge: pkce.codeChallenge,
+  codeChallengeMethod: 'S256',
+});
+req.session.marram = { sessionKey, codeVerifier: pkce.codeVerifier };
+// redirect to authorizationUrl, then at /signed-in?sessionKey=…&claimCode=…:
+const pending = req.session.marram;
+delete req.session.marram;
+const { user, raw } = await marram.sessions.claim('google', pending.sessionKey, pending.codeVerifier, String(req.query.claimCode));
+```
+
+## Connect from the browser with a token
+
+```ts
+// Your server, when the user clicks:
+const { token, jti } = await marram.connectToken({
+  externalUserId: user.id,
+  redirectUrl: 'https://yourapp.com/connected', // wins over anything the page sends
+});
+// Optional restrictions: { provider: 'google', integrationKey: '…', expiresIn: 600 (the default and max; over 600 throws) }
+// Sign-in: const { token } = await marram.signInToken(); // sub optional
+
+// The browser (see @aszura/marram-browser): connect('google', { token }) → finish()
+```
+
+The token is a 10-minute HS256 JWT signed with your signing secret; the claim's response echoes
+its `jti` so you can match results to the token you issued. `mintConnectToken({...})` is the
+standalone signer when you don't have a client.
+
+## Call a provider's API
+
+```ts
+const response = await marram.proxy.fetch('trello', '1/members/me/boards', { externalUserId: user.id });
+if (!response.ok) { /* provider error: inspect response.status / body */ }
+const boards = await response.json();
+
+await marram.proxy.fetch('github', 'repos/acme/app/issues', {
+  externalUserId: user.id,
+  method: 'POST',
+  body: { title: 'Bug' },          // sent as JSON
+  query: { per_page: '50' },
+  headers: { Accept: 'application/vnd.github+json' },
+  // contentType: 'application/x-www-form-urlencoded', // format the provider receives
+  // version: '2022-11-28',        // pin provider API version
+  // integrationKey: '…',          // only if the provider has several integrations and no default
+});
+```
+
+`path` is the provider's API path, without a leading host. It must be non-empty and contain no
+`..` segment. Caller headers starting with `x-marram-` are dropped.
+
+Async: `await marram.proxy.enqueue(provider, path, { externalUserId, callbackUrl })` returns
+`{ requestId }` (HTTP 202). The provider's response is POSTed to `callbackUrl` (public HTTPS).
+Verify that callback with `verifyWebhook`.
+
+## Webhooks
+
+```ts
+import { verifyWebhook } from '@aszura/marram-node';
+
+// Express: app.post('/hooks/marram', express.raw({ type: '*/*' }), handler)
+const valid = await verifyWebhook(req.headers, req.body /* Buffer/raw string */, process.env.MARRAM_SIGNING_SECRET!);
+if (!valid) return res.sendStatus(401);
+const event = JSON.parse(req.body.toString());
+```
+
+`secrets` may be an array during secret rotation. Default timestamp tolerance is 300 s
+(`{ toleranceSeconds }` to change). `verifyWebhook` never throws; it returns false.
+
+Manage subscriptions on a connection:
+
+```ts
+await marram.webhooks.register('github', { externalUserId, kind: 'push', metadata: 'repo-42', body: { /* kind-specific */ } });
+await marram.webhooks.list('github', { externalUserId });
+await marram.webhooks.get('github', webhookKey, { externalUserId });
+await marram.webhooks.update('github', webhookKey, { externalUserId, body: { … } });
+await marram.webhooks.delete('github', webhookKey, { externalUserId });
+const { ingressUrl, setupUrl } = await marram.webhooks.initManual('stripe', { externalUserId, redirectUrl });
+```
+
+`delete` answers `unregisteredAtProvider`: `false` for a manual webhook or one whose connection was
+revoked, which Marram clears without calling the provider. The provider may still hold it; remove
+it in the provider's dashboard. Revoking or disconnecting a user leaves their webhooks running until
+you delete them. The browser SDK's `setUpWebhook` starts a manual setup with a connect token (Marram
+picks the `webhookKey`); `initManual` is the API-key form, needed for a custom key or metadata.
+
+## API reference
+
+All methods are async and throw `MarramError` on a Marram error. `provider` is the provider key,
+e.g. `'google'`. The optional `integrationKey` is only needed when a provider has several
+integrations and no default.
+
+| Call | Returns |
+| --- | --- |
+| `connections.init(provider, { auth, redirectUrl, codeChallenge, codeChallengeMethod: 'S256', externalUserId, theme?: 'light' \| 'dark' }, { integrationKey? })` | `{ flowId, authorizationUrl, message? }` |
+| `connections.claim(provider, flowId, codeVerifier, claimCode)` | `Connection` |
+| `connections.refresh(provider, externalUserId, { integrationKey? })` | `Connection` (throws `CONFLICT` if a refresh is running) |
+| `connections.revoke(provider, externalUserId, { integrationKey? })` | `void`. The browser SDK's `disconnect` does this with a connect token, for the token's own user. The user's webhooks keep running until deleted |
+| `connections.get(provider, externalUserId, { integrationKey? })` | `Connection` (no refresh, no provider call; throws `CONNECTION_NOT_FOUND` or `CONNECTION_REVOKED`) |
+| `connections.list(provider, { integrationKey })` | `Connection[]` |
+| `connectToken({ externalUserId, redirectUrl?, provider?, integrationKey?, expiresIn? })` | `{ token, jti, expiresAt }` (local; needs `signingSecret`) |
+| `signInToken({ externalUserId?, redirectUrl?, provider?, integrationKey?, expiresIn? }?)` | `{ token, jti, expiresAt }` (local; needs `signingSecret`) |
+| `sessions.init(provider, { auth: 'oAuth2', redirectUrl, codeChallenge, codeChallengeMethod, externalUserId?, theme? }, { integrationKey? })` | `{ sessionKey, authorizationUrl, message? }` |
+| `sessions.claim(provider, sessionKey, codeVerifier, claimCode)` | `UserInfo` `{ user, raw, jti? }` |
+| `sessions.userinfo(provider, sessionKey, { integrationKey? })` | `UserInfo` (live from provider) |
+| `sessions.refresh(provider, sessionKey)` | `Session` |
+| `sessions.revoke(provider, sessionKey, { integrationKey? })` | `void` |
+| `sessions.get(provider, sessionKey)` | `Session` (no refresh, no provider call; throws `SESSION_NOT_FOUND` or `SESSION_REVOKED`) |
+| `sessions.list(provider, { integrationKey? })` | `Session[]` |
+| `proxy.fetch(provider, path, ProxyRequest)` | `Response` (any provider status) |
+| `proxy.enqueue(provider, path, ProxyRequest & { callbackUrl })` | `{ requestId }` |
+| `webhooks.register(provider, { externalUserId, kind?, webhookKey?, metadata?, version?, body?, integrationKey? })` | `{ success, webhookKey, providerWebhookId?, kind? }` |
+| `webhooks.list(provider, { externalUserId, integrationKey? })` | `Webhook[]` |
+| `webhooks.get(provider, webhookKey, { externalUserId, integrationKey? })` | `Webhook` |
+| `webhooks.update(provider, webhookKey, { externalUserId, body?, version?, integrationKey? })` | `{ success, webhookKey, … }` |
+| `webhooks.delete(provider, webhookKey, { externalUserId, version?, integrationKey? })` | `{ success, webhookKey, unregisteredAtProvider, … }` |
+| `webhooks.initManual(provider, { externalUserId, redirectUrl?, integrationKey? })` | `{ sessionId, webhookKey, setupUrl, ingressUrl, status: 'pending', fields }`. The browser SDK's `setUpWebhook` does this with a connect token |
+| `environment.integrations()` | `Integration[]` |
+| `environment.identityProviders()` | `IdentityProvider[]` — enabled for sign-in, filtered by release status. The browser SDK's `listIdentityProviders` fetches a trimmed list with a sign-in token |
+| `environment.providers({ externalUserId? })` | `ConnectableProvider[]` — what a user can connect; with `externalUserId`, each integration's `connected`/`connectionStatus` is that user's, else null. The browser SDK's `listProviders` fetches the same list with a connect token |
+
+Browser-flow exports: `connectFlow(marram, { providers, redirectUrl, auth?, theme? })` and
+`signInFlow(...)` → `Flow` with `start(input, { externalUserId? })`, `finish(input)`,
+`express.start(init?)`, `express.finish(onClaimed)`, `web.start(init?)`, `web.finish(onClaimed)`,
+`providers`; `FlowInputError` (`status: 400`, `code`); `flowErrorReply(error)` → `{ status, body } | null`.
+
+Standalone exports: `createPkce()` → `{ codeVerifier, codeChallenge, codeChallengeMethod: 'S256' }`;
+`parseConnectionRedirect(url)` → `{ ok: true, claimCode } | { ok: false, error, errorMessage }`
+(`error` is `'missing_status'` when the URL carries neither `status=connected` nor `error`,
+`'missing_claim_code'` when a connected redirect has no `claimCode`);
+`mintConnectToken({ use, organizationId, environmentId, signingSecret, externalUserId?, … })`;
+`verifyWebhook(headers, rawBody, secrets, opts?)`; `verifyResponse(response, secrets, opts?)`;
+`verifySignature({ body, timestamp, signature, secrets, toleranceSeconds? })`.
+
+Types: `Connection`, `Session`, `Webhook`, `Integration`, `IdentityProvider`, `UserInfo`,
+`FormField`, `AuthType` (`oAuth1 | oAuth2 | api_key | basic | session`), `CredentialStatus`
+(`active | pending | reauth_required | error | revoked | inactive`), `ProxyRequest`,
+`MarramOptions`.
+
+## Errors
+
+```ts
+import { MarramError } from '@aszura/marram-node';
+
+try {
+  await marram.connections.refresh('google', externalUserId);
+} catch (error) {
+  if (error instanceof MarramError) {
+    error.status;    // HTTP status
+    error.code;      // stable code; `HTTP_<status>` if none was sent
+    error.requestId; // quote in support requests
+    error.body;      // parsed JSON or raw text
+  }
+}
+```
+
+Common codes: `INVALID_API_KEY`, `API_KEY_EXPIRED`, `IP_NOT_ALLOWED`, `RATE_LIMITED`,
+`LIMIT_EXCEEDED`, `CONFLICT` (refresh already running; retry shortly), `PROVIDER_NOT_FOUND`,
+`INTEGRATION_NOT_FOUND`, `INTEGRATION_KEY_REQUIRED` (pass `integrationKey`),
+`CONNECTION_NOT_FOUND`, `SESSION_NOT_FOUND`, `WEBHOOK_NOT_FOUND`, `MISSING_EXTERNAL_USER_ID`,
+`MISSING_FLOW_ID`, `MISSING_PKCE_PARAMETERS`,
+`CODE_VERIFIER_MISMATCH` (wrong or reused verifier; start again), `AUTH_TYPE_NOT_SUPPORTED`,
+`BLOCKED_PATH`; token flows add `INVALID_CONNECT_TOKEN`, `CONNECT_TOKEN_EXPIRED`,
+`CONNECT_TOKEN_REUSED`, `CONNECT_TOKEN_WRONG_USE`, `REDIRECT_URL_NOT_ALLOWED`. The full list is
+in `openapi.yaml` under `components.schemas.Error`.
