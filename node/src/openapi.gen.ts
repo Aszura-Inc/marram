@@ -142,9 +142,9 @@ export interface paths {
          *     short-lived connect token your backend mints with the environment's signing secret, which
          *     lets the browser start the flow directly. The token's `sub` is the `externalUserId` (the
          *     body field is ignored) and each token starts exactly one flow. A `redirectUrl` claim in
-         *     the token is where the user returns (the body field is ignored), and must be http(s)
-         *     unless the environment's redirect allowlist names it. Without the claim, the body's
-         *     `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+         *     the token is where the user returns (the body field is ignored). Without the claim, the
+         *     body's `redirectUrl` must be on the environment's redirect allowlist. With an allowlist
+         *     set, a claim must match it too. Either way it must be an http(s) URL.
          */
         post: operations["initConnection"];
         delete?: never;
@@ -592,9 +592,9 @@ export interface paths {
          *     retried with the same token. With a token, Marram always picks the `webhookKey`, and
          *     `x-marram-webhook-key` and `x-marram-metadata` are refused: start the setup with your
          *     API key to set them. The `redirectUrl` follows the same rules as a token-started connect
-         *     flow: a `redirectUrl` claim in the token wins over the body and must be http(s) unless
-         *     the environment's redirect allowlist names it. Without the claim, the body's
-         *     `redirectUrl` must be on that allowlist.
+         *     flow: a `redirectUrl` claim in the token wins over the body, and without the claim the
+         *     body's `redirectUrl` must be on the environment's redirect allowlist. Either way it must
+         *     be an http(s) URL.
          */
         post: operations["initManualWebhook"];
         delete?: never;
@@ -624,9 +624,9 @@ export interface paths {
          *     short-lived sign-in token (`use: "signin"`) your backend mints with the environment's
          *     signing secret, which lets the browser start the sign-in directly. A `sub`, if present,
          *     pins the session to a known user, and each token starts exactly one flow. A `redirectUrl`
-         *     claim in the token is where the user returns (the body field is ignored), and must be
-         *     http(s) unless the environment's redirect allowlist names it. Without the claim, the body's
-         *     `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+         *     claim in the token is where the user returns (the body field is ignored). Without the
+         *     claim, the body's `redirectUrl` must be on the environment's redirect allowlist. With an
+         *     allowlist set, a claim must match it too. Either way it must be an http(s) URL.
          *     `claim` always takes the API key: the identity must reach your backend straight from
          *     Marram, never through the browser.
          */
@@ -871,7 +871,7 @@ export interface components {
          *     status. The first fourteen are generic — the status as a word — and may later be refined.
          * @enum {string}
          */
-        ErrorCode: "BAD_REQUEST" | "UNAUTHORIZED" | "FORBIDDEN" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PAYLOAD_TOO_LARGE" | "UNSUPPORTED_MEDIA_TYPE" | "UNPROCESSABLE" | "RATE_LIMITED" | "INTERNAL_ERROR" | "BAD_GATEWAY" | "UNAVAILABLE" | "GATEWAY_TIMEOUT" | "MISSING_CREDENTIALS" | "INVALID_API_KEY_FORMAT" | "INVALID_API_KEY" | "API_KEY_EXPIRED" | "IP_NOT_ALLOWED" | "ENVIRONMENT_NOT_FOUND" | "LIMIT_EXCEEDED" | "PROVIDER_NOT_FOUND" | "INTEGRATION_NOT_FOUND" | "INTEGRATION_KEY_REQUIRED" | "INVALID_INTEGRATION_KEY" | "CONNECTION_NOT_FOUND" | "SESSION_NOT_FOUND" | "IDENTITY_NOT_FOUND" | "WEBHOOK_NOT_FOUND" | "MISSING_CONNECTION_KEY" | "MISSING_EXTERNAL_USER_ID" | "MISSING_FLOW_ID" | "MISSING_SESSION_KEY" | "MISSING_REDIRECT_URL" | "MISSING_AUTH" | "MISSING_AUTH_TYPE" | "AUTH_TYPE_MISMATCH" | "AUTH_TYPE_NOT_SUPPORTED" | "MISSING_PROVIDER_HEADERS" | "MISSING_PROVIDER_VERSION" | "UNADDRESSED_ARRAY_ITEMS" | "UNRESOLVED_PATH_TOKEN" | "BLOCKED_PATH" | "TOO_MANY_REDIRECTS" | "JSON_BODY_REQUIRED" | "INVALID_CONNECT_TOKEN" | "CONNECT_TOKEN_EXPIRED" | "CONNECT_TOKEN_REUSED" | "CONNECT_TOKEN_WRONG_USE" | "REDIRECT_URL_NOT_ALLOWED" | "MISSING_PKCE_PARAMETERS" | "UNSUPPORTED_CODE_CHALLENGE_METHOD" | "MISSING_CODE_VERIFIER" | "CODE_VERIFIER_MISMATCH" | "NO_CODE_CHALLENGE" | "MISSING_CLAIM_CODE" | "CLAIM_CODE_MISMATCH" | "MISSING_TEMP_CONNECTION_KEY" | "MISSING_TEMP_SESSION_KEY" | "TEMP_CONNECTION_NOT_FOUND" | "TEMP_SESSION_NOT_FOUND" | "TEMP_WEBHOOK_NOT_FOUND" | "CONNECTION_INIT_FAILED" | "SESSION_INIT_FAILED" | "AUTH_NOT_FOUND" | "NO_AUTH_CONFIGURED" | "NO_INTEGRATION_AUTHS" | "NO_PROVIDER_IDENTITIES" | "NO_REVOKE_CONFIG" | "NO_USER_CONFIG" | "MISSING_AUTH_CONFIG" | "MISSING_AUTH_REQUEST_TEMPLATE" | "MISSING_DEFAULT_AUTH_REQUEST_TEMPLATE_ID" | "MISSING_PROVIDER_AUTH_ID" | "MISSING_CONNECTION_FIELDS" | "MISSING_WEBHOOK_FIELDS" | "MISSING_RETURN_URL" | "FIELD_TRANSFORM_FAILED" | "USER_URL_TEMPLATE_FAILED" | "REVOKE_URL_TEMPLATE_FAILED" | "PROVIDER_UNREACHABLE" | "PROVIDER_TIMEOUT" | "PROVIDER_RESPONSE_TOO_LARGE" | "AUTHORIZATION_URL_FAILED" | "REQUEST_TOKEN_FAILED" | "TOKEN_EXCHANGE_FAILED" | "AUTHORIZATION_DENIED" | "REFRESH_FAILED" | "INFO_REQUEST_FAILED" | "INFO_REQUEST_ERROR" | "USERINFO_REQUEST_FAILED" | "USERINFO_REQUEST_ERROR" | "REVOKE_REQUEST_FAILED" | "REVOKE_REQUEST_ERROR" | "CONNECTIONS_LOOKUP_ERROR" | "CONNECTIONS_LOOKUP_FAILED" | "SESSIONS_LOOKUP_ERROR" | "SESSIONS_LOOKUP_FAILED" | "WEBHOOKS_NOT_SUPPORTED" | "MANUAL_WEBHOOKS_NOT_SUPPORTED" | "WEBHOOK_NOT_MANUAL" | "WEBHOOK_KEY_UNAVAILABLE" | "WEBHOOK_KIND_NOT_FOUND" | "WEBHOOK_OPERATION_NOT_SUPPORTED" | "WEBHOOK_CONFIG_GONE" | "WEBHOOK_CONFIG_NO_METHOD" | "WEBHOOK_CONFIG_NO_PATH" | "WEBHOOK_CONFIG_NO_INCOMING" | "WEBHOOK_INGRESS_URL_UNKNOWN" | "WEBHOOK_LIST_FAILED" | "API_KEY_REVOKED" | "INTEGRATION_DISABLED" | "ENVIRONMENT_DISABLED" | "PROVIDER_DISABLED" | "CONNECTION_REVOKED" | "SESSION_REVOKED" | "CONNECTION_REAUTH_REQUIRED" | "SESSION_REAUTH_REQUIRED" | "PROVIDER_REJECTED";
+        ErrorCode: "BAD_REQUEST" | "UNAUTHORIZED" | "FORBIDDEN" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PAYLOAD_TOO_LARGE" | "UNSUPPORTED_MEDIA_TYPE" | "UNPROCESSABLE" | "RATE_LIMITED" | "INTERNAL_ERROR" | "BAD_GATEWAY" | "UNAVAILABLE" | "GATEWAY_TIMEOUT" | "MISSING_CREDENTIALS" | "INVALID_API_KEY_FORMAT" | "INVALID_API_KEY" | "API_KEY_EXPIRED" | "IP_NOT_ALLOWED" | "ENVIRONMENT_NOT_FOUND" | "LIMIT_EXCEEDED" | "PROVIDER_NOT_FOUND" | "INTEGRATION_NOT_FOUND" | "INTEGRATION_KEY_REQUIRED" | "INVALID_INTEGRATION_KEY" | "CONNECTION_NOT_FOUND" | "SESSION_NOT_FOUND" | "IDENTITY_NOT_FOUND" | "WEBHOOK_NOT_FOUND" | "MISSING_CONNECTION_KEY" | "MISSING_EXTERNAL_USER_ID" | "MISSING_FLOW_ID" | "MISSING_SESSION_KEY" | "MISSING_REDIRECT_URL" | "MISSING_AUTH" | "MISSING_AUTH_TYPE" | "AUTH_TYPE_MISMATCH" | "AUTH_TYPE_NOT_SUPPORTED" | "MISSING_PROVIDER_HEADERS" | "MISSING_PROVIDER_VERSION" | "UNADDRESSED_ARRAY_ITEMS" | "UNRESOLVED_PATH_TOKEN" | "BLOCKED_PATH" | "TOO_MANY_REDIRECTS" | "JSON_BODY_REQUIRED" | "INVALID_CONNECT_TOKEN" | "CONNECT_TOKEN_EXPIRED" | "CONNECT_TOKEN_REUSED" | "CONNECT_TOKEN_WRONG_USE" | "REDIRECT_URL_NOT_ALLOWED" | "MISSING_PKCE_PARAMETERS" | "UNSUPPORTED_CODE_CHALLENGE_METHOD" | "MISSING_CODE_VERIFIER" | "CODE_VERIFIER_MISMATCH" | "NO_CODE_CHALLENGE" | "MISSING_CLAIM_CODE" | "CLAIM_CODE_MISMATCH" | "MISSING_TEMP_CONNECTION_KEY" | "MISSING_TEMP_SESSION_KEY" | "TEMP_CONNECTION_NOT_FOUND" | "TEMP_SESSION_NOT_FOUND" | "TEMP_WEBHOOK_NOT_FOUND" | "CONNECTION_INIT_FAILED" | "SESSION_INIT_FAILED" | "NO_AUTH_CONFIGURED" | "NO_PROVIDER_IDENTITIES" | "NO_REVOKE_CONFIG" | "NO_USER_CONFIG" | "MISSING_AUTH_CONFIG" | "MISSING_AUTH_REQUEST_TEMPLATE" | "MISSING_DEFAULT_AUTH_REQUEST_TEMPLATE_ID" | "MISSING_PROVIDER_AUTH_ID" | "MISSING_CONNECTION_FIELDS" | "MISSING_WEBHOOK_FIELDS" | "MISSING_RETURN_URL" | "FIELD_TRANSFORM_FAILED" | "USER_URL_TEMPLATE_FAILED" | "REVOKE_URL_TEMPLATE_FAILED" | "PROVIDER_UNREACHABLE" | "PROVIDER_TIMEOUT" | "PROVIDER_RESPONSE_TOO_LARGE" | "AUTHORIZATION_URL_FAILED" | "REQUEST_TOKEN_FAILED" | "TOKEN_EXCHANGE_FAILED" | "AUTHORIZATION_DENIED" | "REFRESH_FAILED" | "INFO_REQUEST_FAILED" | "INFO_REQUEST_ERROR" | "USERINFO_REQUEST_FAILED" | "USERINFO_REQUEST_ERROR" | "REVOKE_REQUEST_FAILED" | "REVOKE_REQUEST_ERROR" | "CONNECTIONS_LOOKUP_ERROR" | "CONNECTIONS_LOOKUP_FAILED" | "SESSIONS_LOOKUP_ERROR" | "SESSIONS_LOOKUP_FAILED" | "WEBHOOKS_NOT_SUPPORTED" | "MANUAL_WEBHOOKS_NOT_SUPPORTED" | "WEBHOOK_NOT_MANUAL" | "WEBHOOK_KEY_UNAVAILABLE" | "WEBHOOK_KIND_NOT_FOUND" | "WEBHOOK_OPERATION_NOT_SUPPORTED" | "WEBHOOK_CONFIG_GONE" | "WEBHOOK_CONFIG_NO_METHOD" | "WEBHOOK_CONFIG_NO_PATH" | "WEBHOOK_CONFIG_NO_INCOMING" | "WEBHOOK_INGRESS_URL_UNKNOWN" | "WEBHOOK_LIST_FAILED" | "API_KEY_REVOKED" | "INTEGRATION_DISABLED" | "ENVIRONMENT_DISABLED" | "PROVIDER_DISABLED" | "CONNECTION_REVOKED" | "SESSION_REVOKED" | "CONNECTION_REAUTH_REQUIRED" | "SESSION_REAUTH_REQUIRED" | "PROVIDER_REJECTED";
         Pagination: {
             page: number;
             limit: number;

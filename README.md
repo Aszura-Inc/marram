@@ -79,8 +79,8 @@ cd node && npm install && npm test           # Node
 cd browser && npm install && npm test        # Browser
 ```
 
-`openapi.yaml` is copied from the Marram API (`apps/marram-api/openapi.yaml` in the workers
-repo). After updating it, regenerate the Node types with
+`openapi.yaml` is copied from the Marram API (`workers/marram-worker/openapi.yaml` in the
+`aszura` repo). After updating it, regenerate the Node types with
 `npm run openapi:types` in `node/`; `npm run openapi:check` fails while they're stale. All three
 packages are released together under one version: tag `vX.Y.Z` (Packagist reads the tag) and
 publish `@aszura/marram-node@X.Y.Z` from `node/` and `@aszura/marram-browser@X.Y.Z` from `browser/`.

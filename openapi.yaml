@@ -244,9 +244,9 @@ paths:
         short-lived connect token your backend mints with the environment's signing secret, which
         lets the browser start the flow directly. The token's `sub` is the `externalUserId` (the
         body field is ignored) and each token starts exactly one flow. A `redirectUrl` claim in
-        the token is where the user returns (the body field is ignored), and must be http(s)
-        unless the environment's redirect allowlist names it. Without the claim, the body's
-        `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+        the token is where the user returns (the body field is ignored). Without the claim, the
+        body's `redirectUrl` must be on the environment's redirect allowlist. With an allowlist
+        set, a claim must match it too. Either way it must be an http(s) URL.
       requestBody:
         required: true
         content:
@@ -834,9 +834,9 @@ paths:
         retried with the same token. With a token, Marram always picks the `webhookKey`, and
         `x-marram-webhook-key` and `x-marram-metadata` are refused: start the setup with your
         API key to set them. The `redirectUrl` follows the same rules as a token-started connect
-        flow: a `redirectUrl` claim in the token wins over the body and must be http(s) unless
-        the environment's redirect allowlist names it. Without the claim, the body's
-        `redirectUrl` must be on that allowlist.
+        flow: a `redirectUrl` claim in the token wins over the body, and without the claim the
+        body's `redirectUrl` must be on the environment's redirect allowlist. Either way it must
+        be an http(s) URL.
       requestBody:
         required: true
         content:
@@ -888,9 +888,9 @@ paths:
         short-lived sign-in token (`use: "signin"`) your backend mints with the environment's
         signing secret, which lets the browser start the sign-in directly. A `sub`, if present,
         pins the session to a known user, and each token starts exactly one flow. A `redirectUrl`
-        claim in the token is where the user returns (the body field is ignored), and must be
-        http(s) unless the environment's redirect allowlist names it. Without the claim, the body's
-        `redirectUrl` must be on that allowlist. With an allowlist set, a claim must match it too.
+        claim in the token is where the user returns (the body field is ignored). Without the
+        claim, the body's `redirectUrl` must be on the environment's redirect allowlist. With an
+        allowlist set, a claim must match it too. Either way it must be an http(s) URL.
         `claim` always takes the API key: the identity must reach your backend straight from
         Marram, never through the browser.
       requestBody:
@@ -1365,9 +1365,7 @@ components:
         - TEMP_WEBHOOK_NOT_FOUND
         - CONNECTION_INIT_FAILED
         - SESSION_INIT_FAILED
-        - AUTH_NOT_FOUND
         - NO_AUTH_CONFIGURED
-        - NO_INTEGRATION_AUTHS
         - NO_PROVIDER_IDENTITIES
         - NO_REVOKE_CONFIG
         - NO_USER_CONFIG
