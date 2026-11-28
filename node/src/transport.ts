@@ -60,7 +60,10 @@ export class Transport {
     if (typeof fetchImpl !== 'function') {
       throw new TypeError('Marram: no global fetch — pass `fetch` in the options.');
     }
-    this.#fetch = fetchImpl;
+    // Called as a plain function. Stored and called as `this.#fetch(...)`, fetch would run with
+    // `this` set to the Transport, which Node allows and Cloudflare Workers refuses with
+    // "Illegal invocation", failing every call.
+    this.#fetch = (input, init) => fetchImpl(input, init);
   }
 
   url(path: string, query?: TransportRequest['query']): string {

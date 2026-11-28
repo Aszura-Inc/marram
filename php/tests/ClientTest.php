@@ -261,7 +261,19 @@ final class ClientTest extends TestCase
         $http = new FakeHttpClient();
         $marram = self::client($http);
 
-        foreach (['/', '1/../admin'] as $path) {
+        // URL parsing resolves each of these to a dot segment, which would reach another Marram
+        // route with the API key (DELETE /v1/connections/github/revoke, for one).
+        $paths = [
+            '/',
+            '1/../admin',
+            '%2e%2e/%2e%2e/connections/github/revoke',
+            '.%2E/connections/github/revoke',
+            '..\\..\\connections/github/revoke',
+            './1/me',
+            '1/me#fragment',
+        ];
+
+        foreach ($paths as $path) {
             try {
                 $marram->proxy->request('GET', 'trello', $path, 'user-1');
                 self::fail("expected {$path} to be rejected");
@@ -269,6 +281,18 @@ final class ClientTest extends TestCase
             }
         }
         self::assertCount(0, $http->requests);
+    }
+
+    public function testProxyStillAllowsDotsInsideASegment(): void
+    {
+        $http = new FakeHttpClient(FakeHttpClient::json(200, []));
+
+        self::client($http)->proxy->request('GET', 'github', 'repos/a/b/compare/main...dev', 'user-1');
+
+        self::assertSame(
+            'https://api-staging.marram.dev/v1/proxy/github/repos/a/b/compare/main...dev',
+            (string) $http->requests[0]->getUri(),
+        );
     }
 
     public function testPkceReturnsAnS256ChallengeOfTheVerifier(): void

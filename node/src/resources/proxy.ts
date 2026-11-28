@@ -2,6 +2,21 @@ import { MarramError } from '../errors.ts';
 import { segment, type Transport } from '../transport.ts';
 import type { JsonBody } from '../types.ts';
 
+/**
+ * A dot segment would lift the call out of /proxy/{provider}/ onto another Marram route, run with
+ * this API key. URL parsing resolves `%2e%2e` as `..` and reads `\` as `/` before Marram sees
+ * the path, so the worker can't refuse it: this check is the only one. A `#` would cut the path
+ * and drop the query.
+ */
+function isUnsafeProviderPath(providerPath: string): boolean {
+  if (providerPath.includes('#')) return true;
+
+  return providerPath
+    .split(/[\\/]/)
+    .map((part) => part.replace(/%2e/gi, '.'))
+    .some((part) => part === '.' || part === '..');
+}
+
 export interface ProxyRequest {
   /** Your own ID for the user whose connection to act as. */
   externalUserId: string;
@@ -57,8 +72,10 @@ export class ProviderProxy {
 
   #build(provider: string, path: string, request: ProxyRequest) {
     const providerPath = path.replace(/^\/+/, '');
-    if (providerPath === '' || providerPath.split('/').includes('..')) {
-      throw new TypeError('Marram: the proxy path must be a non-empty provider API path.');
+    if (providerPath === '' || isUnsafeProviderPath(providerPath)) {
+      throw new TypeError(
+        'Marram: the proxy path must be a provider API path, with no dot segments or fragment.',
+      );
     }
 
     // Drop caller x-marram-* headers so they can't override the user or callback.

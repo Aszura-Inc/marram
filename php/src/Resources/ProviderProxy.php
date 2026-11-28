@@ -101,11 +101,33 @@ final class ProviderProxy
     private function path(string $provider, string $path): string
     {
         $providerPath = ltrim($path, '/');
-        if ($providerPath === '' || in_array('..', explode('/', $providerPath), true)) {
-            throw new \InvalidArgumentException('Marram: the proxy path must be a non-empty provider API path.');
+        if ($providerPath === '' || self::isUnsafe($providerPath)) {
+            throw new \InvalidArgumentException('Marram: the proxy path must be a provider API path, with no dot segments or fragment.');
         }
 
         return 'proxy/' . Transport::segment($provider) . '/' . $providerPath;
+    }
+
+    /**
+     * A dot segment would lift the call out of /proxy/{provider}/ onto another Marram route, run
+     * with this API key. URL parsing resolves `%2e%2e` as `..` and reads `\` as `/` before Marram
+     * sees the path, so the API can't refuse it: this check is the only one. A `#` would cut the
+     * path and drop the query.
+     */
+    private static function isUnsafe(string $providerPath): bool
+    {
+        if (str_contains($providerPath, '#')) {
+            return true;
+        }
+
+        foreach (preg_split('#[/\\\\]#', $providerPath) ?: [] as $part) {
+            $part = str_ireplace('%2e', '.', $part);
+            if ($part === '.' || $part === '..') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

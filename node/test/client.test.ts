@@ -284,11 +284,63 @@ describe('proxy', () => {
       marram.proxy.fetch('trello', '/', { externalUserId: 'user-1' }),
       TypeError,
     );
-    await assert.rejects(
-      marram.proxy.fetch('trello', '1/../admin', { externalUserId: 'user-1' }),
-      TypeError,
-    );
+    // URL parsing resolves each of these to a dot segment, which would reach another Marram
+    // route with the API key (DELETE /v1/connections/github/revoke, for one).
+    for (const path of [
+      '1/../admin',
+      '%2e%2e/%2e%2e/connections/github/revoke',
+      '.%2E/connections/github/revoke',
+      '..\\..\\connections/github/revoke',
+      './1/me',
+      '1/me#fragment',
+    ]) {
+      await assert.rejects(
+        marram.proxy.fetch('trello', path, { externalUserId: 'user-1' }),
+        TypeError,
+        path,
+      );
+    }
     assert.equal(calls.length, 0);
+  });
+
+  it('still allows dots inside a segment', async () => {
+    const { fetch, calls } = fakeFetch(json(200, {}));
+    await client(fetch).proxy.fetch('github', 'repos/a/b/compare/main...dev', {
+      externalUserId: 'user-1',
+    });
+    assert.equal(
+      calls[0]!.url,
+      'https://api-staging.marram.dev/v1/proxy/github/repos/a/b/compare/main...dev',
+    );
+  });
+});
+
+describe('runtimes', () => {
+  // Cloudflare Workers throws "Illegal invocation" when fetch runs with `this` bound to anything
+  // but the global object; Node doesn't, so this stands in for the Workers runtime.
+  function strictFetch(this: unknown): Promise<Response> {
+    if (this !== undefined && this !== globalThis) {
+      return Promise.reject(new TypeError('Illegal invocation'));
+    }
+    return Promise.resolve(json(200, { integrations: [] }));
+  }
+
+  it('calls an injected fetch as a plain function', async () => {
+    const marram = client(strictFetch as typeof globalThis.fetch);
+    await marram.environment.integrations();
+  });
+
+  it('calls the global fetch as a plain function', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = strictFetch as typeof globalThis.fetch;
+    try {
+      await new Marram({
+        apiKey: 'sk_test_01ENV',
+        environment: 'staging',
+      }).environment.integrations();
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });
 
